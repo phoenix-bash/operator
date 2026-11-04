@@ -1,18 +1,17 @@
 // ============================================================================
-// relay.js  —  v4 (verbose)
+// relay.js  —  v4.1 (fixes the boot crash)
 //
-// Adds:
-//   - Boot banner with env, node version, listen host:port.
-//   - Every HTTP request logged: method, url, ip, ua, status, ms.
-//   - WS lifecycle: connect, role, token ok/fail, close code, reason.
-//   - Agent hello / offline with full info.
-//   - Operator attach / detach, per-op forwarding counts.
-//   - Periodic heartbeat log every 60s: agents, operators, counters.
-//   - Drops and errors are WARN/ERROR with the reason.
-//   - /debug endpoint: JSON snapshot of full relay state.
-//   - /health unchanged (for cron).
+// Crash: ReferenceError: wsSafe is not defined
+// Cause: 'use strict' — assigning to an undeclared identifier throws.
+//        wsSafe = (...) => ...  is an implicit global, which strict mode
+//        rejects. Declare it: const wsSafe = (...).
 //
-// Behavior is identical to v3 — this is observability only.
+// Also fixed while in here:
+//   - operators Set holds op objects only (v4 briefly mixed ws and op).
+//   - autoAttachIfLone no longer takes stray args.
+//   - wsSafe defined before any handler that uses it (hoisted const is
+//     fine because it's referenced only inside callbacks).
+//   - Frames/outs/logs still counted, heartbeat kept.
 // ============================================================================
 
 'use strict';
@@ -36,10 +35,7 @@ function warn(...a)  { console.log(tag('WARN'),  ...a); }
 function error(...a) { console.log(tag('ERROR'), ...a); }
 function debug(...a) { if (process.env.RELAY_DEBUG) console.log(tag('DEBUG'), ...a); }
 
-// ---------------------------------------------------------------------------
-// Boot banner
-// ---------------------------------------------------------------------------
-info('relay v4 booting');
+info('relay v4.1 booting');
 info('  node     ', process.version);
 info('  pid      ', process.pid);
 info('  boot_ts  ', BOOT_TS);
@@ -55,24 +51,33 @@ if (!TOKEN || TOKEN.length < 16) {
 }
 
 // ---------------------------------------------------------------------------
+// Safe send — declared with const so strict mode is happy
+// ---------------------------------------------------------------------------
+const wsSafe = (sock, payload) => {
+  if (!sock || sock.readyState !== 1) return false;
+  try { sock.send(payload); return true; }
+  catch (e) { warn('ws send failed:', e.message); return false; }
+};
+
+// ---------------------------------------------------------------------------
 // State
 // ---------------------------------------------------------------------------
-const agents    = new Map();   // id -> { ws, info, lastSeen, framesSent, outsSent, logsSent, id }
-const operators = new Set();   // { ws, id, attachedTo, id }
+const agents    = new Map();   // id -> { ws, info, lastSeen, framesSent, outsSent, logsSent }
+const operators = new Set();   // Set of op objects: { ws, id, attachedTo }
 let   opSeq     = 0;
 
 const stats = {
-  httpRequests:   0,
-  wsConnects:     0,
-  wsRejects:      0,
-  framesIn:       0,
-  framesForwarded:0,
-  outsIn:         0,
-  outsForwarded:  0,
-  logsIn:         0,
-  logsForwarded:  0,
-  cmdsForwarded:  0,
-  drops:          0
+  httpRequests: 0,
+  wsConnects: 0,
+  wsRejects: 0,
+  framesIn: 0,
+  framesForwarded: 0,
+  outsIn: 0,
+  outsForwarded: 0,
+  logsIn: 0,
+  logsForwarded: 0,
+  cmdsForwarded: 0,
+  drops: 0
 };
 
 // ---------------------------------------------------------------------------
@@ -150,7 +155,6 @@ const server = http.createServer((req, res) => {
 // WSS
 // ---------------------------------------------------------------------------
 const wss = new WebSocketServer({ server, path: '/ws' });
-
 wss.on('error', (e) => error('wss error:', e.message));
 
 wss.on('connection', (ws, req) => {
@@ -178,12 +182,6 @@ wss.on('connection', (ws, req) => {
   else { stats.wsRejects++; warn(`ws REJECT bad role="${role}"`); ws.close(4002, 'bad role'); }
 });
 
-wsSafe = (sock, payload) => {
-  if (!sock || sock.readyState !== 1) return false;
-  try { sock.send(payload); return true; }
-  catch (e) { warn('ws send failed:', e.message); return false; }
-};
-
 // ---------------------------------------------------------------------------
 // Agent
 // ---------------------------------------------------------------------------
@@ -203,7 +201,7 @@ function onAgent(ws, req) {
       });
       info(`agent ONLINE id=${id} host=${msg.info?.hostname || '?'} user=${msg.info?.user || '?'}`);
       broadcastAgentList();
-      autoAttachIfLone(id);
+      autoAttachIfLone();
       return;
     }
 
@@ -252,11 +250,6 @@ function onAgent(ws, req) {
 // ---------------------------------------------------------------------------
 function onOperator(ws, req) {
   const op = { ws, id: ++opSeq, attachedTo: null };
-  operators.add(ws); // keep set of ws, but we also track op objects
-  // to keep the two consistent, store op object on ws
-  ws._op = op;
-  // operators Set currently holds ws; adjust to hold op:
-  operators.delete(ws);
   operators.add(op);
 
   info(`operator CONNECT id=op${op.id} total=${operators.size}`);
@@ -266,11 +259,11 @@ function onOperator(ws, req) {
     try { msg = JSON.parse(raw.toString()); }
     catch { warn(`operator op${op.id} bad JSON`); return; }
 
-    debug(`op${op.id} -> ${msg.op} ${msg.id ? 'id='+msg.id : ''}`);
+    debug(`op${op.id} -> ${msg.op}${msg.id ? ' id='+msg.id : ''}`);
 
     if (msg.op === 'list') {
       wsSafe(ws, JSON.stringify({ op: 'agents', list: listAgents() }));
-      autoAttachIfLone(undefined, op);
+      autoAttachIfLone();
       return;
     }
     if (msg.op === 'attach') {
@@ -328,7 +321,7 @@ function broadcastAgentList() {
   debug(`broadcast agents list to ${n}/${operators.size} operators`);
 }
 
-function autoAttachIfLone(agentId, opArg) {
+function autoAttachIfLone() {
   if (agents.size !== 1) return;
   const onlyId = [...agents.keys()][0];
   for (const op of operators) {
@@ -352,7 +345,7 @@ setInterval(() => {
 }, 60000).unref();
 
 // ---------------------------------------------------------------------------
-// Graceful shutdown
+// Shutdown
 // ---------------------------------------------------------------------------
 function shutdown(sig) {
   info(`received ${sig}, shutting down`);
@@ -362,17 +355,13 @@ function shutdown(sig) {
 }
 process.on('SIGTERM', () => shutdown('SIGTERM'));
 process.on('SIGINT',  () => shutdown('SIGINT'));
-process.on('uncaughtException', (e) => {
-  error('UNCAUGHT:', e.stack || e.message);
-});
-process.on('unhandledRejection', (e) => {
-  error('UNHANDLED REJECTION:', e?.stack || String(e));
-});
+process.on('uncaughtException', (e) => { error('UNCAUGHT:', e.stack || e.message); });
+process.on('unhandledRejection', (e) => { error('UNHANDLED REJECTION:', e?.stack || String(e)); });
 
 // ---------------------------------------------------------------------------
 // Listen
 // ---------------------------------------------------------------------------
 server.listen(PORT, HOST, () => {
-  info(`relay v4 LIVE on ${HOST}:${PORT}`);
+  info(`relay v4.1 LIVE on ${HOST}:${PORT}`);
   info('endpoints:  /health  /debug  /ws  /');
 });
