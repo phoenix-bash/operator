@@ -383,7 +383,7 @@ function onAgent(ws, req) {
       agents.set(sid, {
         sid,
         id: reported,
-        ws, info: msg.info || {}, lastSeen: Date.now(),
+        ws, info: msg.info || {}, lastSeen: Date.now(), lastPong: Date.now(),
         framesSent: 0, outsSent: 0, logsSent: 0, pcmSent: 0,
         camFramesSent: 0,
         streamOn: false, shotQuality: 80, shotMaxW: 0, shotIntervalMs: 500,
@@ -404,6 +404,7 @@ function onAgent(ws, req) {
     }
     const a = agents.get(sid);
     a.lastSeen = Date.now();
+    if (msg.op === 'pong') a.lastPong = Date.now();
 
     if (msg.op === 'frame')    stats.framesIn++;
     if (msg.op === 'camframe') stats.camFramesIn++;
@@ -661,15 +662,37 @@ function autoAttachIfLone() {
 // 25s keeps bytes flowing and gives a half-open socket something to fail on,
 // so the agent's own 5s reconnect loop can take over.
 //
-// The agent answers {"op":"pong"} and the relay already accepts that. No
-// timeout is enforced here on purpose: a slow pong must never drop an agent
-// that is otherwise fine.
+// The agent answers {"op":"pong"} and the relay already accepts that. The
+// timeout lives in the reaper below rather than here, so a slow pong costs a
+// whole interval of slack before anything is dropped.
 // ---------------------------------------------------------------------------
+const PING_MS = Number(process.env.RELAY_PING_MS || 25000);
 setInterval(() => {
   const ping = JSON.stringify({ op: 'ping' });
   for (const a of agents.values()) wsSafe(a.ws, ping);
   for (const op of operators)      wsSafe(op.ws, ping);
-}, 25000).unref();
+}, PING_MS).unref();
+
+// Reap agents that stop answering. wsSafe cannot detect this on its own: a
+// half-open TCP socket still reports readyState OPEN, and send() happily
+// buffers into the kernel, so a dead agent would stay in the list forever and
+// every command aimed at it would vanish. The agent answers {"op":"pong"}, so
+// two silent intervals is a reliable signal. Operators are exempt on purpose:
+// the console never answers a ping, so the same rule would drop live tabs.
+// The floor is two ping intervals, so a healthy agent can never be reaped
+// merely because the timeout was configured shorter than the ping cadence.
+const AGENT_PONG_TIMEOUT = Math.max(PING_MS * 2,
+  Number(process.env.AGENT_PONG_TIMEOUT_MS || 60000));
+setInterval(() => {
+  const now = Date.now();
+  for (const a of agents.values()) {
+    const last = a.lastPong || a.lastSeen || now;
+    if (now - last > AGENT_PONG_TIMEOUT) {
+      warn(`agent ${a.sid} id=${a.id} silent for ${Math.round((now - last) / 1000)}s - terminating`);
+      try { a.ws.terminate(); } catch {}
+    }
+  }
+}, Math.max(1000, Math.min(10000, PING_MS))).unref();
 
 // ---------------------------------------------------------------------------
 // Heartbeat
