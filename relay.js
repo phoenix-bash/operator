@@ -1,11 +1,21 @@
 // ============================================================================
-// relay.js  —  v4.7
+// relay.js  -  v4.8
+//
+// Differences vs v4.7:
+//   - Keepalive: every agent and operator socket gets {"op":"ping"} every 25s.
+//     Idle WebSockets were being dropped by whatever sits between the agent and
+//     the relay, and neither end was told, so the device vanished from the list
+//     until the laptop was touched. The agent already answers {"op":"pong"}.
+//   - /debug now carries a "recent" ring buffer of the last 60 connect and
+//     disconnect events. It answers "is the agent flapping, or is it just not
+//     running?" without reading the log stream. IPs are masked to three octets.
 //
 // Differences vs v4.6:
 //   - Bootstrap endpoints for machines that cannot self-update yet:
 //       GET /agent.exe          the built Agent.exe
 //       GET /agent.sha256       its SHA-256, for the installer to verify
 //       GET /install-agent.ps1  the installer script
+//       GET /diag-agent.ps1     the read-only diagnostic script
 //     All three require the relay token (X-Relay-Token header, or ?token=).
 //   - Query strings are stripped from HTTP logs: /ws?token=... was writing the
 //     relay token into the Render log stream.
@@ -76,6 +86,7 @@ const HOST    = process.env.HOST || '0.0.0.0';
 // a patched build without touching the real one.
 const AGENT_EXE    = process.env.AGENT_EXE || path.join(__dirname, 'Agent.exe');
 const INSTALL_PS1  = path.join(__dirname, 'install-agent.ps1');
+const DIAG_PS1     = path.join(__dirname, 'diag-agent.ps1');
 
 // The token may arrive as a header (preferred, never logged) or a query param
 // (kept for convenience, stripped from logs above).
@@ -98,7 +109,7 @@ function debug(...a) { if (process.env.RELAY_DEBUG) console.log(tag('DEBUG'), ..
 // ---------------------------------------------------------------------------
 // Boot banner
 // ---------------------------------------------------------------------------
-info('relay v4.7 booting');
+info('relay v4.8 booting');
 info('  node     ', process.version);
 info('  pid      ', process.pid);
 info('  boot_ts  ', BOOT_TS);
@@ -131,6 +142,28 @@ const wsSafe = (sock, payload) => {
 const agents    = new Map();
 const operators = new Set();   // Set of op objects: { ws, id, attachedTo }
 let   opSeq     = 0;
+
+// ---------------------------------------------------------------------------
+// Recent events
+//
+// A ring buffer of connect/disconnect events, exposed at /debug. Without it the
+// only way to answer "is the agent flapping or just never running?" is to read
+// the Render log stream, which is awkward to correlate. With it, /debug alone
+// shows the pattern: tight bursts mean a reconnect loop, wide gaps mean the
+// machine is asleep or the agent is not starting.
+//
+// IPs are masked to three octets because /debug is unauthenticated.
+// ---------------------------------------------------------------------------
+const recentEvents = [];
+const RECENT_MAX = 60;
+function noteEvent(evt) {
+  recentEvents.push({ t: new Date().toISOString(), ...evt });
+  if (recentEvents.length > RECENT_MAX) recentEvents.shift();
+}
+function maskIp(ip) {
+  const s = String(ip || '?');
+  return s.includes('.') ? s.replace(/\.\d+$/, '.x') : s;
+}
 
 const stats = {
   httpRequests:    0,
@@ -217,6 +250,7 @@ const server = http.createServer((req, res) => {
     res.writeHead(200, {'content-type':'application/json'});
     res.end(JSON.stringify({
       ok: true, boot: BOOT_TS, agents: ag, operators: op, stats,
+      recent: recentEvents,
       ts: Date.now()
     }, null, 2));
     return;
@@ -228,15 +262,17 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  if (route === '/agent.exe' || route === '/agent.sha256' || route === '/install-agent.ps1') {
+  if (route === '/agent.exe' || route === '/agent.sha256' ||
+      route === '/install-agent.ps1' || route === '/diag-agent.ps1') {
     if (!url || !tokenOk(req, url)) {
       res.writeHead(401, {'content-type':'text/plain'});
       res.end('unauthorized\n');
       return;
     }
     try {
-      if (route === '/install-agent.ps1') {
-        const ps1 = fs.readFileSync(INSTALL_PS1, 'utf8');
+      if (route === '/install-agent.ps1' || route === '/diag-agent.ps1') {
+        const file = route === '/diag-agent.ps1' ? DIAG_PS1 : INSTALL_PS1;
+        const ps1 = fs.readFileSync(file, 'utf8');
         res.writeHead(200, {
           'content-type': 'text/plain; charset=utf-8',
           'cache-control': 'no-store, must-revalidate'
@@ -316,16 +352,18 @@ wss.on('connection', (ws, req) => {
              .toString().split(',')[0].trim();
 
   info(`ws connect role=${role||'?'} ip=${ip} token=${tok ? `${tok.length}c` : 'none'}`);
+  noteEvent({ ev: 'ws', role: role || '?', ip: maskIp(ip) });
 
   if (tok !== TOKEN) {
     stats.wsRejects++;
     warn(`ws REJECT bad token role=${role} ip=${ip}`);
+    noteEvent({ ev: 'reject', why: 'token', role, ip: maskIp(ip) });
     ws.close(4001, 'bad token');
     return;
   }
   if (role === 'agent')         onAgent(ws, req);
   else if (role === 'operator') onOperator(ws, req);
-  else { stats.wsRejects++; warn(`ws REJECT bad role="${role}"`); ws.close(4002, 'bad role'); }
+  else { stats.wsRejects++; warn(`ws REJECT bad role="${role}"`); noteEvent({ ev: 'reject', why: 'role', role }); ws.close(4002, 'bad role'); }
 });
 
 // ---------------------------------------------------------------------------
@@ -352,6 +390,7 @@ function onAgent(ws, req) {
         camOn: false, camQuality: 80, camMaxW: 0, camIntervalMs: 500
       });
       const twins = [...agents.values()].filter(a => a.id === reported).length - 1;
+      noteEvent({ ev: 'agent-in', sid: sid.slice(0, 8), id: reported });
       info(`agent ONLINE sid=${sid} id=${reported} host=${msg.info?.hostname || '?'} ` +
            `user=${msg.info?.user || '?'}${twins ? ` (duplicate id, ${twins} other copy)` : ''}`);
       broadcastAgentList();
@@ -417,6 +456,7 @@ function onAgent(ws, req) {
   ws.on('close', (code, reason) => {
     if (!sid) return;
     const a = agents.get(sid);
+    noteEvent({ ev: 'agent-out', sid: sid.slice(0, 8), id: a?.id || '?', code });
     info(`agent OFFLINE sid=${sid} id=${a?.id || '?'} code=${code} reason=${reason || '-'}`);
     agents.delete(sid);
     // Detach every operator pointing at the dead agent, and tell them why.
@@ -438,6 +478,7 @@ function onOperator(ws, req) {
   const op = { ws, id: ++opSeq, attachedTo: null };
   operators.add(op);
 
+  noteEvent({ ev: 'op-in', op: op.id });
   info(`operator CONNECT id=op${op.id} total=${operators.size}`);
 
   ws.on('message', (raw) => {
@@ -521,6 +562,7 @@ function onOperator(ws, req) {
   });
 
   ws.on('close', (code, reason) => {
+    noteEvent({ ev: 'op-out', op: op.id, code });
     info(`operator DISCONNECT id=op${op.id} code=${code} reason=${reason || '-'} total=${operators.size - 1}`);
     operators.delete(op);
     // Nobody is watching any more: stop the agent from burning bandwidth.
@@ -610,6 +652,26 @@ function autoAttachIfLone() {
 }
 
 // ---------------------------------------------------------------------------
+// Keepalive
+//
+// An idle agent socket carries no traffic at all. Anything between the agent
+// and the relay that drops idle WebSockets — a cloud proxy, a laptop Wi-Fi
+// adapter going into power save — then kills the session without telling
+// either end, and the device silently disappears from the list. A ping every
+// 25s keeps bytes flowing and gives a half-open socket something to fail on,
+// so the agent's own 5s reconnect loop can take over.
+//
+// The agent answers {"op":"pong"} and the relay already accepts that. No
+// timeout is enforced here on purpose: a slow pong must never drop an agent
+// that is otherwise fine.
+// ---------------------------------------------------------------------------
+setInterval(() => {
+  const ping = JSON.stringify({ op: 'ping' });
+  for (const a of agents.values()) wsSafe(a.ws, ping);
+  for (const op of operators)      wsSafe(op.ws, ping);
+}, 25000).unref();
+
+// ---------------------------------------------------------------------------
 // Heartbeat
 // ---------------------------------------------------------------------------
 setInterval(() => {
@@ -639,7 +701,15 @@ process.on('unhandledRejection', (e) => { error('UNHANDLED REJECTION:', e?.stack
 // ---------------------------------------------------------------------------
 // Listen
 // ---------------------------------------------------------------------------
+// A failed bind used to leave the process alive and not listening, which on a
+// host like Render means a zombie that never serves anything. Exit instead so
+// the platform restarts the service.
+server.on('error', (e) => {
+  error('server error:', e.message);
+  process.exit(1);
+});
+
 server.listen(PORT, HOST, () => {
-  info(`relay v4.7 LIVE on ${HOST}:${PORT}`);
-  info('endpoints:  /health  /debug  /ws  / (console)  /agent.exe  /install-agent.ps1');
+  info(`relay v4.8 LIVE on ${HOST}:${PORT}`);
+  info('endpoints:  /health  /debug  /ws  / (console)  /agent.exe  /install-agent.ps1  /diag-agent.ps1');
 });
